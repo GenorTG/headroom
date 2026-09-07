@@ -51,6 +51,7 @@ class EventLevelCCRInterceptor:
         reconstruction = bytearray()
         reconstruction_available = True
         private_indexes: set[int] = set()
+        visible_indexes: dict[int, int] = {}
         private_item_ids: set[str] = set()
         detected_private = False
         detected_client_tool = False
@@ -98,7 +99,13 @@ class EventLevelCCRInterceptor:
                     if isinstance(index, int) and index in private_indexes:
                         continue
                     if isinstance(index, int):
-                        max_visible_index = max(max_visible_index, index)
+                        if event_type == "content_block_start":
+                            visible_indexes[index] = len(visible_indexes)
+                        visible_index = visible_indexes.get(index, index)
+                        if visible_index != index:
+                            event["index"] = visible_index
+                            raw_event = _encode_sse_event(event)
+                        max_visible_index = max(max_visible_index, visible_index)
                     if event_type in {"message_delta", "message_stop"} and detected_private:
                         held_terminal.append(raw_event)
                         continue

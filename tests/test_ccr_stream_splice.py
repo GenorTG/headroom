@@ -479,3 +479,95 @@ async def test_large_ordinary_stream_stays_live_after_reconstruction_window_clos
     assert b"x" * 150 in output
     assert b"y" * 150 in output
     assert b"event: error" not in output
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "names",
+    [
+        ["headroom_retrieve", "write_file"],
+        ["write_file", "headroom_retrieve", "read_file"],
+        ["headroom_retrieve", "write_file", "headroom_retrieve", "read_file"],
+    ],
+)
+async def test_anthropic_visible_indexes_are_consumable_by_sdk(names):
+    from anthropic import Anthropic
+
+    events = [
+        {
+            "type": "message_start",
+            "message": {
+                "id": "msg-test",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude",
+                "content": [],
+                "stop_reason": None,
+                "stop_sequence": None,
+                "usage": {"input_tokens": 1, "output_tokens": 0},
+            },
+        }
+    ]
+    for index, name in enumerate(names):
+        events.extend(
+            [
+                {
+                    "type": "content_block_start",
+                    "index": index,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": f"tool-{index}",
+                        "name": name,
+                        "input": {},
+                    },
+                },
+                {
+                    "type": "content_block_delta",
+                    "index": index,
+                    "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": '{"path":"a"}',
+                    },
+                },
+                {"type": "content_block_stop", "index": index},
+            ]
+        )
+    events.extend(
+        [
+            {
+                "type": "message_delta",
+                "delta": {"stop_reason": "tool_use", "stop_sequence": None},
+                "usage": {"output_tokens": 10},
+            },
+            {"type": "message_stop"},
+        ]
+    )
+
+    async def no_continuation(*args):
+        raise AssertionError("client-owned tool calls must return to the client")
+
+    interceptor = EventLevelCCRInterceptor(
+        CCRResponseHandler(), provider="anthropic", render_response=lambda response: []
+    )
+    output = b"".join(
+        [
+            chunk
+            async for chunk in interceptor.process(
+                _chunks([_event(event) for event in events]), [], None, no_continuation
+            )
+        ]
+    )
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(
+            200, headers={"content-type": "text/event-stream"}, content=output
+        )
+    )
+    with Anthropic(api_key="local-test", http_client=httpx.Client(transport=transport)) as client:
+        with client.messages.stream(
+            model="claude", max_tokens=10, messages=[{"role": "user", "content": "test"}]
+        ) as stream:
+            message = stream.get_final_message()
+    assert [block.name for block in message.content] == [
+        name for name in names if name != "headroom_retrieve"
+    ]
+    assert all(block.input == {"path": "a"} for block in message.content)
