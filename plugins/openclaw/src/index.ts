@@ -8,4 +8,5 @@ export {
   applyGatewayProviderBaseUrls,
   applyGatewayProviderBaseUrlsInPlace,
   resolveGatewayProviderIds,
+  type GatewayRoutingOverrides,
 } from "./gateway-config.js";

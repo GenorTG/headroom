@@ -1,5 +1,22 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
+/**
+ * Gateway-side rewriting for OpenClaw model provider base URLs.
+ *
+ * When a plugin routes a request to the local headroom proxy, two things
+ * must happen on the in-memory provider config:
+ *
+ *   1. `baseUrl` must point at the proxy (host + port) so subsequent
+ *      OpenClaw HTTP calls land at the proxy rather than the upstream.
+ *   2. The proxy must know which upstream to forward to. The proxy's
+ *      documented mechanism for per-request upstream routing is the
+ *      `x-headroom-base-url` header (see
+ *      https://docs.headroomlabs.ai/docs/configuration#proxy-upstream-override-x-headroom-base-url).
+ *
+ * Item (2) lets one proxy instance serve multiple OpenAI-compatible
+ * upstreams without needing extra processes or extra config slots.
+ */
+
 export const DEFAULT_GATEWAY_PROVIDER_IDS = ["openai-codex"] as const;
 
 const DEFAULT_PROVIDER_BASE_URLS: Readonly<Record<string, string>> = {
@@ -54,13 +71,32 @@ function normalizeGatewayProviderIds(value: unknown): string[] {
   return normalized;
 }
 
+/**
+ * Optional per-provider upstream override.
+ *
+ * `providerUpstreams[providerId]` is the absolute URL of the upstream the
+ * proxy should forward to when the rewritten provider is contacted. URLs
+ * must not include a trailing `/v1`; the proxy appends the request path
+ * (`/v1/messages`, `/v1/chat/completions`, ...) directly to whatever the
+ * override URL is.
+ */
+export interface GatewayRoutingOverrides {
+  providerUpstreams?: Readonly<Record<string, string>>;
+}
+
 export function applyGatewayProviderBaseUrls<T>(
   cfg: T,
   proxyUrl: string,
   providerIds: readonly string[],
+  overrides?: GatewayRoutingOverrides,
 ): { changed: boolean; config: T } {
   const next = structuredClone((cfg ?? {}) as any);
-  const changed = applyGatewayProviderBaseUrlsInPlace(next, proxyUrl, providerIds);
+  const changed = applyGatewayProviderBaseUrlsInPlace(
+    next,
+    proxyUrl,
+    providerIds,
+    overrides,
+  );
   return { changed, config: next as T };
 }
 
@@ -68,10 +104,13 @@ export function applyGatewayProviderBaseUrlsInPlace(
   cfg: any,
   proxyUrl: string,
   providerIds: readonly string[],
+  overrides?: GatewayRoutingOverrides,
 ): boolean {
   if (!cfg || typeof cfg !== "object" || providerIds.length === 0) {
     return false;
   }
+
+  const providerUpstreams = overrides?.providerUpstreams ?? {};
 
   const models = (cfg.models ??= {});
   const providers = (models.providers ??= {});
@@ -107,17 +146,51 @@ export function applyGatewayProviderBaseUrlsInPlace(
       changed = true;
     }
 
-    if (nextConfig.baseUrl === nextBaseUrl) {
-      providers[providerId] = nextConfig;
-      continue;
+    let mutated = false;
+
+    if (nextConfig.baseUrl !== nextBaseUrl) {
+      nextConfig.baseUrl = nextBaseUrl;
+      mutated = true;
     }
 
-    nextConfig.baseUrl = nextBaseUrl;
-    providers[providerId] = nextConfig;
-    changed = true;
+    mutated = injectHeader(
+      nextConfig,
+      "x-headroom-base-url",
+      providerUpstreams[providerId],
+    ) || mutated;
+
+    if (mutated) {
+      providers[providerId] = nextConfig;
+      changed = true;
+    }
   }
 
   return changed;
+}
+
+/**
+ * Merge `headerName: headerValue` into `target.headers` if a non-empty
+ * value is supplied and the value is not already present. Returns true
+ * when the header was added or changed. The merge preserves unrelated
+ * existing headers so other plugins' contributions are not disturbed.
+ */
+function injectHeader(
+  target: Record<string, any>,
+  headerName: string,
+  headerValue: string | undefined,
+): boolean {
+  if (!headerName || !headerValue || headerValue.length === 0) {
+    return false;
+  }
+  const existingHeaders =
+    target.headers && typeof target.headers === "object" && !Array.isArray(target.headers)
+      ? target.headers
+      : {};
+  if (existingHeaders[headerName] === headerValue) {
+    return false;
+  }
+  target.headers = { ...existingHeaders, [headerName]: headerValue };
+  return true;
 }
 
 function routeBaseUrlThroughProxy(params: {

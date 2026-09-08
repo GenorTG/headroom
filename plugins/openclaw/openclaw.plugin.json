@@ -41,6 +41,10 @@
     "gatewayProviderIds": {
       "label": "Gateway Provider IDs",
       "help": "Optional list of OpenClaw provider ids to route through the active Headroom proxy in memory. Friendly aliases codex, claude, copilot, and gemini are also accepted. When set, this overrides the default openai-codex-only routing."
+    },
+    "providerUpstreams": {
+      "label": "Provider Upstream Overrides",
+      "help": "Optional map from OpenClaw provider id to absolute upstream URL. When the headroom plugin rewrites a provider's base URL, it also injects an x-headroom-base-url header so the proxy can forward to the listed upstream (for OpenAI-compatible providers such as OpenRouter or opencode-go whose URLs are not /v1-rooted). URLs must NOT include a trailing /v1 — the proxy appends the request path itself. Requires HEADROOM_UPSTREAM_ALLOWED_HOSTS on the proxy to whitelist the upstream host."
     }
   },
   "configSchema": {
@@ -106,6 +110,14 @@
           "type": "string"
         },
         "default": []
+      },
+      "providerUpstreams": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "string",
+          "pattern": "^https?://.+(:\\d+)?/?$"
+        },
+        "default": {}
       }
     }
   },
