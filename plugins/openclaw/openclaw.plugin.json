@@ -45,6 +45,10 @@
     "providerUpstreams": {
       "label": "Provider Upstream Overrides",
       "help": "Optional map from OpenClaw provider id to absolute upstream URL. When the headroom plugin rewrites a provider's base URL, it also injects an x-headroom-base-url header so the proxy can forward to the listed upstream (for OpenAI-compatible providers such as OpenRouter or opencode-go whose URLs are not /v1-rooted). URLs must NOT include a trailing /v1 — the proxy appends the request path itself. Requires HEADROOM_UPSTREAM_ALLOWED_HOSTS on the proxy to whitelist the upstream host."
+    },
+    "providerSessionHeaders": {
+      "label": "Provider Session Headers",
+      "help": "Optional map from OpenClaw provider id to a header name. The headroom plugin generates a per-process UUID and injects it under that header on requests to the provider, so OpenAI-compatible third-party APIs that route via a server-side session/accounting layer (e.g. opencode-go's x-opencode-session) can identify the session without the caller having to thread a session id through every chat-completions call."
     }
   },
   "configSchema": {
@@ -116,6 +120,14 @@
         "additionalProperties": {
           "type": "string",
           "pattern": "^https?://.+(:\\d+)?/?$"
+        },
+        "default": {}
+      },
+      "providerSessionHeaders": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9-]+$"
         },
         "default": {}
       }

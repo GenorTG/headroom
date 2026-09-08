@@ -10,3 +10,8 @@ export {
   resolveGatewayProviderIds,
   type GatewayRoutingOverrides,
 } from "./gateway-config.js";
+export {
+  readProviderSessionHeaders,
+  ensureSessionId,
+  type SessionHeaderMap,
+} from "./session-headers.js";
