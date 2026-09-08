@@ -276,8 +276,13 @@ export class HeadroomContextEngine {
     sessionId: string;
     advancementKey: string;
     acceptedTurn: unknown;
-  }): Promise<{ committed: boolean; reason?: string }> {
-    return { committed: true, reason: "compression-only engine; transcript owned by OpenClaw runtime" };
+  }): Promise<{ status: "committed" | "duplicate"; reason?: string }> {
+    // OpenClaw 2026.9.x requires `status: "committed"` (or `"duplicate"`)
+    // from commitTurn; the outbox row is deleted only when the runtime sees a
+    // recognized status. Returning `{ committed: true }` (old shape) leaves the
+    // advancement key stuck in the durable turn outbox, which degrades this
+    // engine to legacy for every subsequent turn and blocks assemble().
+    return { status: "committed", reason: "compression-only engine; transcript owned by OpenClaw runtime" };
   }
 
   async dispose(): Promise<void> {

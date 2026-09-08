@@ -250,4 +250,18 @@ describe("HeadroomContextEngine proxy startup helpers", () => {
       expect.stringContaining("Circuit breaker opened"),
     );
   });
+
+  it("commitTurn returns the durable-advancement status contract", async () => {
+    const engine = new HeadroomContextEngine();
+    const result = await engine.commitTurn({
+      sessionId: "session-1",
+      advancementKey: "turn-1",
+      acceptedTurn: {},
+    });
+    // OpenClaw 2026.9.x deletes the durable turn outbox row only when the
+    // result carries a recognized `status` ("committed" | "duplicate").
+    // A bare `{ committed: true }` leaves the advancement key stuck and
+    // degrades the engine to legacy for every following turn.
+    expect(result.status).toBe("committed");
+  });
 });
