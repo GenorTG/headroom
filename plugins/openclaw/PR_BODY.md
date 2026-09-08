@@ -6,11 +6,11 @@ This PR addresses three related issues in the headroom OpenClaw plugin:
 
 1. **Compression is silently disabled on OpenClaw 2026.9.x.** The runtime added a durable-turn contract for context engines; engines that don't declare their `transcriptSemantics` are still loaded but bypassed per logical turn in favor of the legacy engine, which means `assemble()` never fires. The proxy log shows `[context-engine] Context engine "headroom" degraded to "legacy" for this logical turn: current-turn transcript fencing is not declared` on every turn before this fix; zero appearances after.
 
-2. **One proxy, one upstream.** `ANTHROPIC_TARGET_API_URL` and `OPENAI_TARGET_API_URL` each point at one upstream, but real deployments route many OpenAI-compatible APIs (OpenRouter, opencode-go, Venice, Together, Groq, ...) through one proxy. The proxy *already* documents a per-request upstream override mechanism (`x-headroom-base-url` header); the plugin just wasn't wired to use it.
+2. **One proxy, one upstream.** `ANTHROPIC_TARGET_API_URL` and `OPENAI_TARGET_API_URL` each point at one upstream, but real deployments route many OpenAI-compatible APIs (OpenRouter, opencode-go, Together, Groq, ...) through one proxy. The proxy *already* documents a per-request upstream override mechanism (`x-headroom-base-url` header); the plugin just wasn't wired to use it.
 
 3. **opencode-go fails with `MissingSessionID` (400) on every request** through the proxy because its `/zen/go/v1/chat/completions` endpoint requires an `x-opencode-session` UUID header. The OpenClaw opencode-go plugin does not generate one; the docs are linked only from the error body. This adds a generic per-provider session-header injection so operators can enable a session for any provider that gates on a server-side session/accounting layer.
 
-Closes # (no upstream issue opened; surfaced from internal production use on genorbox1 with Minimax-M3 via Venice Anthropic-shape, OpenRouter, and opencode-go).
+Closes # (no upstream issue opened; surfaced from internal production use on genorbox1 with minimax-portal/MiniMax-M3 against Minimax's anthropic-compat endpoint at api.minimax.io, OpenRouter, and opencode-go).
 
 **Before this PR:**
 - 0% input compression on OpenClaw 2026.9.x (compression engine bypassed per turn)
@@ -96,7 +96,7 @@ DTS dist/index.d.ts 12.72 KB
   - headroom plugin fork `~/work/headroom/plugins/openclaw` (this PR)
   - headroom proxy `0.37.0` stock at `127.0.0.1:8787`
   - systemd user service `~/.config/systemd/user/headroom-proxy.service` with `ANTHROPIC_TARGET_API_URL=https://api.minimax.io/anthropic` and `HEADROOM_UPSTREAM_ALLOWED_HOSTS=api.minimax.io,openrouter.ai,opencode.ai`
-  - providers: `minimax-portal` (Anthropic-shape via Venice), `openrouter` (OpenRouter paid API), `opencode-go` (OpenCode Go Zen)
+  - providers: `minimax-portal` (Anthropic-shape via Minimax's anthropic-compat endpoint), `openrouter` (paid key, tested via the `openrouter/free` auto-router which selects a free model at request time), `opencode-go` (OpenCode Go Zen)
 - Exact command / steps:
   1. Apply all 5 commits to a clean checkout of `plugins/openclaw` on top of `headroomlabs-ai/headroom:main`
   2. `npm install && npm run build`
@@ -118,7 +118,7 @@ DTS dist/index.d.ts 12.72 KB
 
 - Rollout-managed feature(s): `providerUpstreams` and `providerSessionHeaders` are opt-in (default to `{}`). Patch 1's `transcriptSemantics` is informational metadata that older runtimes ignore. Patch 3 changes the behavior of `applyGatewayProviderBaseUrls*` (URL pathname normalization) — see "Breaking change" notes below.
 - Minimum rollout channel: any user on OpenClaw 2026.9.x with the headroom plugin installed can adopt this immediately. No canary needed because the new config keys default to `{}` and Patch 1 is metadata-only.
-- Stable/default behavior changed: Yes, for operators who already had `gatewayProviderIds` set with providers whose URLs are not `/v1`-rooted (OpenRouter, opencode-go, Venice, etc.). Before this PR those providers 404'd at the proxy. After this PR they route correctly **provided** the operator configures `providerUpstreams`. Without `providerUpstreams`, requests still go to the proxy's default upstream (the env-var-configured `OPENAI_TARGET_API_URL`) instead of the provider's first-party URL.
+- Stable/default behavior changed: Yes, for operators who already had `gatewayProviderIds` set with providers whose URLs are not `/v1`-rooted (in our deployment: OpenRouter at `/api/v1`, opencode-go at `/zen/go/v1`). Before this PR those providers 404'd at the proxy. After this PR they route correctly **provided** the operator configures `providerUpstreams`. Without `providerUpstreams`, requests still go to the proxy's default upstream (the env-var-configured `OPENAI_TARGET_API_URL`) instead of the provider's first-party URL.
 - Kill switch / disable path: revert this commit and the path-normalization reverts (the prior "preserve upstream pathname" behavior returns). For operators who have configured `providerUpstreams`, removing those entries reverts to the proxy's default-upstream routing.
 - Unsafe override required: No. All new config keys are additive and default to empty. Existing operators who don't configure them see zero behavior change.
 - Qualification impact: Patch 1 may improve the qualification of downstream compression metrics (CCR cache, content_router) on operators using OpenClaw 2026.9.x because `assemble()` now actually fires.
