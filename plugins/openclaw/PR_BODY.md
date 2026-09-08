@@ -92,27 +92,39 @@ DTS dist/index.d.ts 12.72 KB
 ## Real Behavior Proof
 
 - Environment:
-  - OpenClaw `2026.9.2` (gateway from /home/linuxbrew/.linuxbrew/lib/node_modules/openclaw)
-  - headroom plugin fork `~/work/headroom/plugins/openclaw` (this PR)
-  - headroom proxy `0.37.0` stock at `127.0.0.1:8787`
-  - systemd user service `~/.config/systemd/user/headroom-proxy.service` with `ANTHROPIC_TARGET_API_URL=https://api.minimax.io/anthropic` and `HEADROOM_UPSTREAM_ALLOWED_HOSTS=api.minimax.io,openrouter.ai,opencode.ai`
-  - providers: `minimax-portal` (Anthropic-shape via Minimax's anthropic-compat endpoint), `openrouter` (paid key, tested via the `openrouter/free` auto-router which selects a free model at request time), `opencode-go` (OpenCode Go Zen)
 - Exact command / steps:
-  1. Apply all 5 commits to a clean checkout of `plugins/openclaw` on top of `headroomlabs-ai/headroom:main`
-  2. `npm install && npm run build`
-  3. Install via `openclaw plugins install --link dist --force --accept-capabilities --acknowledge-install-policy-warning`
-  4. Set the plugin config in `~/.openclaw/openclaw.json` (see "Configuration" section below)
-  5. Restart OpenClaw gateway: `systemctl --user restart openclaw-gateway.service`
 - Observed result:
-  - Minimax-Anthropic (`minimax-portal/MiniMax-M3`): 67 requests routed through proxy → `api.minimax.io/anthropic/v1/messages`, all 200 OK, `assemble()` fired, `transforms=content_router:code_aware:mixed:log:text:tabular:config:html`
-  - OpenRouter (`openrouter/free` → `nvidia/nemotron-3-ultra-550b-a55b:free`): 25 requests routed through proxy with `x-headroom-base-url: https://openrouter.ai/api`, all 200 OK
-  - opencode-go (`opencode-go/mimo-v2.5`): requests routed through proxy with `x-headroom-base-url: https://opencode.ai/zen/go` and `x-opencode-session: <uuid>`, all 200 OK, returns coherent reply in ~7s
-  - Per-turn compression measured: `tok_before=233435 tok_after=211938 tok_saved=21497` (9.2% on a single turn), `tok_before=432427 tok_after=382342` (11.6% on a heavier turn)
-  - Overall: 432 requests through proxy, 5.58M tokens removed, 7.66% overall savings
 - Not tested:
-  - OpenClaw < 2026.9.x — Patch 1's `transcriptSemantics` field is ignored by older runtimes that don't read it, and the `commitTurn()` method is only called by runtimes that advertise the contract, so behavior should be unchanged for older runtimes. Not verified empirically — only the 2026.9.x runtime is in scope here.
-  - Remote (HTTPS) headroom proxy with the upstream TLS termination story. The local-proxy configuration is what's in production.
-  - Multi-process headroom proxy fleet. The plugin targets a single proxy origin per OpenClaw gateway; load balancing across multiple proxies would require a different design (out of scope).
+
+### Environment.
+
+- OpenClaw `2026.9.2` (gateway from /home/linuxbrew/.linuxbrew/lib/node_modules/openclaw)
+- headroom plugin fork `~/work/headroom/plugins/openclaw` (this PR)
+- headroom proxy `0.37.0` stock at `127.0.0.1:8787`
+- systemd user service `~/.config/systemd/user/headroom-proxy.service` with `ANTHROPIC_TARGET_API_URL=https://api.minimax.io/anthropic` and `HEADROOM_UPSTREAM_ALLOWED_HOSTS=api.minimax.io,openrouter.ai,opencode.ai`
+- providers: `minimax-portal` (Anthropic-shape via Minimax's anthropic-compat endpoint), `openrouter` (paid key, tested via the `openrouter/free` auto-router which selects a free model at request time), `opencode-go` (OpenCode Go Zen)
+
+### Exact command / steps.
+
+1. Apply all 5 commits to a clean checkout of `plugins/openclaw` on top of `headroomlabs-ai/headroom:main`
+2. `npm install && npm run build`
+3. Install via `openclaw plugins install --link dist --force --accept-capabilities --acknowledge-install-policy-warning`
+4. Set the plugin config in `~/.openclaw/openclaw.json` (see "Configuration" section below)
+5. Restart OpenClaw gateway: `systemctl --user restart openclaw-gateway.service`
+
+### Observed result.
+
+- Minimax-Anthropic (`minimax-portal/MiniMax-M3`): 67 requests routed through proxy → `api.minimax.io/anthropic/v1/messages`, all 200 OK, `assemble()` fired, `transforms=content_router:code_aware:mixed:log:text:tabular:config:html`
+- OpenRouter (`openrouter/free` → `nvidia/nemotron-3-ultra-550b-a55b:free`): 25 requests routed through proxy with `x-headroom-base-url: https://openrouter.ai/api`, all 200 OK
+- opencode-go (`opencode-go/mimo-v2.5`): requests routed through proxy with `x-headroom-base-url: https://opencode.ai/zen/go` and `x-opencode-session: <uuid>`, all 200 OK, returns coherent reply in ~7s
+- Per-turn compression measured: `tok_before=233435 tok_after=211938 tok_saved=21497` (9.2% on a single turn), `tok_before=432427 tok_after=382342` (11.6% on a heavier turn)
+- Overall: 432 requests through proxy, 5.58M tokens removed, 7.66% overall savings
+
+### Not tested.
+
+- OpenClaw < 2026.9.x — Patch 1's `transcriptSemantics` field is ignored by older runtimes that don't read it, and the `commitTurn()` method is only called by runtimes that advertise the contract, so behavior should be unchanged for older runtimes. Not verified empirically — only the 2026.9.x runtime is in scope here.
+- Remote (HTTPS) headroom proxy with the upstream TLS termination story. The local-proxy configuration is what's in production.
+- Multi-process headroom proxy fleet. The plugin targets a single proxy origin per OpenClaw gateway; load balancing across multiple proxies would require a different design (out of scope).
 
 ## Runtime Rollout Safety
 
