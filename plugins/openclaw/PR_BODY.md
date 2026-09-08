@@ -10,7 +10,7 @@ This PR addresses three related issues in the headroom OpenClaw plugin:
 
 3. **opencode-go fails with `MissingSessionID` (400) on every request** through the proxy because its `/zen/go/v1/chat/completions` endpoint requires an `x-opencode-session` UUID header. The OpenClaw opencode-go plugin does not generate one; the docs are linked only from the error body. This adds a generic per-provider session-header injection so operators can enable a session for any provider that gates on a server-side session/accounting layer.
 
-Closes # (no upstream issue opened; surfaced from internal production use on genorbox1 with minimax-portal/MiniMax-M3 against Minimax's anthropic-compat endpoint at api.minimax.io, OpenRouter, and opencode-go).
+Closes # (no upstream issue opened; surfaced from internal production use with minimax-portal/MiniMax-M3 against Minimax's anthropic-compat endpoint at api.minimax.io, OpenRouter, and opencode-go).
 
 **Before this PR:**
 - 0% input compression on OpenClaw 2026.9.x (compression engine bypassed per turn)
@@ -200,4 +200,4 @@ Operators who do not want multi-upstream routing can omit `gatewayProviderIds` e
 - **Follow-ups:**
   - Patch 1 should be backported to the stock headroom plugin (this PR's `git log` history is the natural backport patch series; each commit is independent).
   - If upstream wants to land the runtime contract change (`transcriptSemantics`) in their own tests, the test for "still loaded but bypassed per turn when contract not declared" would be a useful regression test against OpenClaw 2026.9.x runtimes.
-- **Maintainer context:** The first 4 commits each address one focused issue with a focused fix; the 5th is the test update + a small bug uncovered while writing tests. Each commit message documents the use case, the design choice, and the behavioral change. No `AMYPATCH` / `amypatched` / `genorbox1` markers anywhere in the diff; the PR diff is the same as if it were written from scratch by an upstream contributor.
+- **Maintainer context:** The first 4 commits each address one focused issue with a focused fix; the 5th is the test update plus a small bug uncovered while writing tests. Each commit message documents the use case, the design choice, and the behavioral change.
