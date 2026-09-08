@@ -35,6 +35,25 @@ export class HeadroomContextEngine {
     name: "Headroom Context Compression",
     version: "0.1.0",
     ownsCompaction: true,
+    // OpenClaw 2026.9.x added a durable-turn contract for context engines: any
+    // engine that participates in admitted-turn lifecycle must declare its
+    // fencing semantics so the runtime knows how to read prior transcripts
+    // before this engine runs, and so turn advancement can be replayed
+    // safely on retry. Engines that don't declare this contract are still
+    // loaded but are bypassed per logical turn in favor of the legacy
+    // engine — which silently disables `assemble()` and the SmartCrusher
+    // transforms on every turn.
+    //
+    // headroom is a compression-only engine that does not own the canonical
+    // transcript (OpenClaw's runtime persists messages). We fence on the
+    // user-entry boundary so the runtime commits admitted turns up to and
+    // including the user entry but excludes the assistant response under
+    // construction, and we declare atomic-idempotent advancement so
+    // retries collapse to the same turn record.
+    transcriptSemantics: {
+      currentTurnFence: "before-current-turn-entry-v1",
+      turnAdvancementIdempotency: "atomic-idempotent-v1",
+    },
   };
 
   private proxyManager: ProxyManager;
@@ -242,6 +261,23 @@ export class HeadroomContextEngine {
     reason: string;
   }): Promise<void> {
     // No-op
+  }
+
+  /**
+   * Atomic + idempotent turn commit. OpenClaw calls this once the run for
+   * a logical turn completes successfully; the engine must acknowledge by
+   * either committing the turn (so retries collapse to the same record)
+   * or rejecting it. Because headroom does not own the canonical transcript
+   * (compression is the only transformation we apply, and the runtime
+   * persists messages itself), we always accept the turn and return
+   * immediately. The runtime then proceeds to the next logical turn.
+   */
+  async commitTurn(params: {
+    sessionId: string;
+    advancementKey: string;
+    acceptedTurn: unknown;
+  }): Promise<{ committed: boolean; reason?: string }> {
+    return { committed: true, reason: "compression-only engine; transcript owned by OpenClaw runtime" };
   }
 
   async dispose(): Promise<void> {
