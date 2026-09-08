@@ -89,3 +89,16 @@ export function ensureSessionId(providerId: string): string {
   sessionIdCache.set(providerId, fresh);
   return fresh;
 }
+
+/**
+ * Reset the session-id cache. Intended for test isolation only.
+ *
+ * The production process generates one session id per provider and
+ * keeps it for the lifetime of the process; the cache is intentionally
+ * a module-level singleton. Tests that exercise multiple providers in
+ * a single vitest run can call this between cases to keep deterministic
+ * assertions about "the session id is a UUID".
+ */
+export function __resetSessionIdCacheForTests(): void {
+  sessionIdCache.clear();
+}
