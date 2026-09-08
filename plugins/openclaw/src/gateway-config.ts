@@ -72,16 +72,22 @@ function normalizeGatewayProviderIds(value: unknown): string[] {
 }
 
 /**
- * Optional per-provider upstream override.
+ * Optional per-provider routing overrides.
  *
  * `providerUpstreams[providerId]` is the absolute URL of the upstream the
  * proxy should forward to when the rewritten provider is contacted. URLs
  * must not include a trailing `/v1`; the proxy appends the request path
  * (`/v1/messages`, `/v1/chat/completions`, ...) directly to whatever the
  * override URL is.
+ *
+ * `providerSessionHeaders[providerId]` is the name of a header the plugin
+ * should add to that provider's `headers` map, populated with a stable
+ * per-process session id. See `../session-headers.ts` for the rationale
+ * and the id-generation policy.
  */
 export interface GatewayRoutingOverrides {
   providerUpstreams?: Readonly<Record<string, string>>;
+  providerSessionHeaders?: Readonly<Record<string, string>>;
 }
 
 export function applyGatewayProviderBaseUrls<T>(
@@ -111,6 +117,7 @@ export function applyGatewayProviderBaseUrlsInPlace(
   }
 
   const providerUpstreams = overrides?.providerUpstreams ?? {};
+  const providerSessionHeaders = overrides?.providerSessionHeaders ?? {};
 
   const models = (cfg.models ??= {});
   const providers = (models.providers ??= {});
@@ -158,6 +165,20 @@ export function applyGatewayProviderBaseUrlsInPlace(
       "x-headroom-base-url",
       providerUpstreams[providerId],
     ) || mutated;
+
+    const sessionHeaderName = providerSessionHeaders[providerId];
+    if (sessionHeaderName) {
+      // Lazy require to avoid pulling crypto/random shims into a module
+      // that does not need them when the operator has no providers
+      // configured to need a session header.
+      const { ensureSessionId } =
+        require("./session-headers.js") as typeof import("./session-headers.js");
+      mutated = injectHeader(
+        nextConfig,
+        sessionHeaderName,
+        ensureSessionId(providerId),
+      ) || mutated;
+    }
 
     if (mutated) {
       providers[providerId] = nextConfig;

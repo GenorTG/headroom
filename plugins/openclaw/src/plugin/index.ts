@@ -21,6 +21,7 @@ import {
   resolveGatewayProviderIds,
 } from "../gateway-config.js";
 import { normalizeAndValidateProxyUrl, probeHeadroomProxy } from "../proxy-manager.js";
+import { readProviderSessionHeaders } from "../session-headers.js";
 import { createHeadroomRetrieveTool } from "../tools/headroom-retrieve.js";
 
 /**
@@ -59,6 +60,7 @@ export function registerHeadroomPlugin(api: any) {
     try {
       const overrides = {
         providerUpstreams: readProviderUpstreams(api.config),
+        providerSessionHeaders: readProviderSessionHeaders(api.config),
       };
       const changed = applyGatewayProviderBaseUrlsInPlace(
         api.config,
