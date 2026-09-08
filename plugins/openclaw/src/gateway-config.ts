@@ -1,5 +1,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
+import { ensureSessionId } from "./session-headers.js";
+
 /**
  * Gateway-side rewriting for OpenClaw model provider base URLs.
  *
@@ -168,11 +170,6 @@ export function applyGatewayProviderBaseUrlsInPlace(
 
     const sessionHeaderName = providerSessionHeaders[providerId];
     if (sessionHeaderName) {
-      // Lazy require to avoid pulling crypto/random shims into a module
-      // that does not need them when the operator has no providers
-      // configured to need a session header.
-      const { ensureSessionId } =
-        require("./session-headers.js") as typeof import("./session-headers.js");
       mutated = injectHeader(
         nextConfig,
         sessionHeaderName,
@@ -221,7 +218,18 @@ function routeBaseUrlThroughProxy(params: {
 }): string {
   const upstreamBaseUrl = params.currentBaseUrl ?? DEFAULT_PROVIDER_BASE_URLS[params.providerId];
   if (!upstreamBaseUrl) {
-    return params.proxyUrl;
+    // No upstream URL is configured for this provider (e.g. a built-in
+    // bundled provider with a hard-coded DEFAULT entry that we didn't
+    // match, or a provider id that simply doesn't have a baseUrl yet).
+    // Normalize the proxy pathname to "/v1" anyway so the request lands
+    // at a proxy-recognized route prefix.
+    try {
+      const proxy = new URL(params.proxyUrl);
+      proxy.pathname = "/v1";
+      return proxy.toString().replace(/\/$/, "");
+    } catch {
+      return params.proxyUrl;
+    }
   }
 
   try {
