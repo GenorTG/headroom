@@ -206,7 +206,20 @@ function routeBaseUrlThroughProxy(params: {
   try {
     const proxy = new URL(params.proxyUrl);
     const upstream = new URL(upstreamBaseUrl);
-    proxy.pathname = upstream.pathname;
+    // Normalize the rewritten proxy URL's pathname to "/v1" so it always
+    // matches one of the proxy's recognized route prefixes
+    // (`/v1/messages`, `/v1/chat/completions`, `/v1/responses`,
+    // `/anthropic/v1/messages`, ...). Third-party providers whose first-
+    // party URL is not /v1-rooted (OpenRouter at `/api/v1`, opencode-go
+    // at `/zen/go/v1`, Venice at `/api/v1`, ...) otherwise end up at a
+    // proxy URL whose path matches nothing and the proxy returns 404.
+    //
+    // Per-provider upstream targeting is handled separately via the
+    // `x-headroom-base-url` request header (added in a preceding
+    // commit), so collapsing the proxy pathname here loses no
+    // information: the proxy forwards to `<header value>` + the request
+    // path, not to the rewritten proxy URL + the request path.
+    proxy.pathname = "/v1";
     proxy.search = upstream.search;
     proxy.hash = "";
     return proxy.toString().replace(/\/$/, "");
