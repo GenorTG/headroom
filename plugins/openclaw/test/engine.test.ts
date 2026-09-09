@@ -199,6 +199,25 @@ describe("HeadroomContextEngine proxy startup helpers", () => {
     expect(mocked.start).toHaveBeenCalledTimes(1);
   });
 
+  it("skips proxy compression when context is clearly under token budget", async () => {
+    const engine = new HeadroomContextEngine();
+    (engine as { proxyUrl: string | null }).proxyUrl = "http://127.0.0.1:8787";
+    const messages = [{ role: "user", content: "hello" }];
+
+    await expect(
+      engine.assemble({
+        sessionId: "session-1",
+        messages,
+        tokenBudget: 1_000_000,
+      }),
+    ).resolves.toMatchObject({
+      messages,
+      estimatedTokens: expect.any(Number),
+    });
+
+    expect(compress).not.toHaveBeenCalled();
+  });
+
   it("clears the request timeout after successful compression", async () => {
     vi.useFakeTimers();
     try {
