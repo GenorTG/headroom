@@ -2,13 +2,17 @@
 
 <!-- Briefly explain the change and why it is needed. -->
 
-This PR addresses three related issues in the headroom OpenClaw plugin:
+This PR addresses five related issues in the headroom OpenClaw plugin:
 
 1. **Compression is silently disabled on OpenClaw 2026.9.x.** The runtime added a durable-turn contract for context engines; engines that don't declare their `transcriptSemantics` are still loaded but bypassed per logical turn in favor of the legacy engine, which means `assemble()` never fires. The proxy log shows `[context-engine] Context engine "headroom" degraded to "legacy" for this logical turn: current-turn transcript fencing is not declared` on every turn before this fix; zero appearances after.
 
 2. **One proxy, one upstream.** `ANTHROPIC_TARGET_API_URL` and `OPENAI_TARGET_API_URL` each point at one upstream, but real deployments route many OpenAI-compatible APIs (OpenRouter, opencode-go, Together, Groq, ...) through one proxy. The proxy *already* documents a per-request upstream override mechanism (`x-headroom-base-url` header); the plugin just wasn't wired to use it.
 
 3. **opencode-go fails with `MissingSessionID` (400) on every request** through the proxy because its `/zen/go/v1/chat/completions` endpoint requires an `x-opencode-session` UUID header. The OpenClaw opencode-go plugin does not generate one; the docs are linked only from the error body. This adds a generic per-provider session-header injection so operators can enable a session for any provider that gates on a server-side session/accounting layer.
+
+4. **`/compact` and auto-compaction were no-ops.** With `ownsCompaction: true`, OpenClaw skips LLM summarization and delegates to the context engine — but `compact()` returned `{ compacted: true }` instantly without shrinking the SQLite transcript. Manual `/compact` on 888k-token sessions appeared to succeed while changing nothing.
+
+5. **`assemble()` always hit the proxy**, even when context was already under budget (e.g. 100–200k tokens on a 1M-window model). Every turn paid multi-minute Kompress/tokenizer cost; in `HEADROOM_MODE=cache` many runs saved 0 tokens anyway (`router:noop`, prefix frozen).
 
 Closes # (no upstream issue opened; surfaced from internal production use with minimax-portal/MiniMax-M3 against Minimax's anthropic-compat endpoint at api.minimax.io, OpenRouter, and opencode-go).
 
@@ -21,6 +25,8 @@ Closes # (no upstream issue opened; surfaced from internal production use with m
 - Compression actually runs (empirical: 7.66% overall token savings measured in production, 9.1% average per compressed turn, with one turn hitting 50k tokens saved / 11.6%)
 - One proxy serves many OpenAI-compatible upstreams via `x-headroom-base-url`
 - opencode-go works end-to-end via `x-opencode-session`
+- `/compact` and `maintain()` durably rewrite the SQLite transcript via Headroom `/v1/compress` (`x-headroom-mode: token`, `lossy_inline`, `frozen_message_count: 0`), with branch+truncate fallback when the proxy returns noop on huge sessions
+- `assemble()` skips proxy compression when estimated tokens are clearly under budget (~85% of `tokenBudget`), avoiding pointless CPU on sub-850k contexts
 
 ## Type of Change
 
@@ -43,6 +49,12 @@ Closes # (no upstream issue opened; surfaced from internal production use with m
   Generic opt-in mechanism for injecting a per-process UUID under an operator-chosen header name. The plugin does not hardcode any provider-specific header names.
 - **Commit 5** `Add tests for new behavior + fix no-upstream proxy pathname`
   Rewrites the existing tests that documented the old "preserve upstream pathname" contract, adds new tests for the new behavior, fixes a bug in the no-upstream branch of `routeBaseUrlThroughProxy` that would have left the bare proxy origin in place when no upstream URL was configured, and converts a runtime `require()` to a static ESM import so Vitest's TS resolver handles it correctly.
+- **Commit 6** `Fix commitTurn() return shape for OpenClaw 2026.9.x`
+  OpenClaw 2026.9.x expects `{ status: "committed" }` from `commitTurn()`; the initial implementation returned `{ committed: true }`, which left rows stuck in `context_engine_turn_outbox` and caused silent per-turn degradation to legacy. This commit aligns the return shape and adds a regression test.
+- **Commit 7** `Implement durable transcript compaction via Headroom proxy`
+  Adds `src/compaction.ts`: loads the active branch via OpenClaw `SessionManager`, calls Headroom `/v1/compress`, persists via `rewriteTranscriptEntries` or branch+truncate when noop/force. Wires real `compact()` and `maintain()` in `engine.ts`. Includes `test/compaction.test.ts` and `openclaw-agent-sessions.d.ts` for the plugin-sdk import.
+- **Commit 8** `Skip assemble compression when context is under token budget`
+  Adds `estimateRoughTokens()` in `convert.ts` and a short-circuit in `assemble()` when `roughTokens < tokenBudget * 0.85`. Regression test in `engine.test.ts`. Production effect: 100–200k sessions on 1M models skip multi-minute proxy work; Headroom CPU drops to near-idle on those turns.
 
 ## Testing
 
@@ -61,16 +73,10 @@ Closes # (no upstream issue opened; surfaced from internal production use with m
 
 ```
 $ npm test
- ✓ test/proxy-manager.test.ts (34 tests) 342ms
- ✓ test/engine.test.ts
- ✓ test/engine-normalization.test.ts
- ✓ test/convert.test.ts
- ✓ test/gateway-config.test.ts
- ✓ test/plugin-runtime-routing.test.ts
 
- Test Files  6 passed (6)
-      Tests  84 passed (84)
-   Duration  1.41s
+ Test Files  7 passed (7)
+      Tests  89 passed (89)
+   Duration  ~1.2s
 ```
 
 ```
@@ -82,19 +88,12 @@ $ npm run typecheck
 
 ```
 $ npm run build
-ESM dist/index.js     44.16 KB
-ESM dist/index.js.map 91.57 KB
-ESM ⚡️ Build success in 16ms
-DTS ⚡️ Build success in 1311ms
-DTS dist/index.d.ts 12.72 KB
+ESM dist/index.js     ~56 KB
+ESM ⚡️ Build success
+DTS dist/index.d.ts   ~13 KB
 ```
 
 ## Real Behavior Proof
-
-- Environment:
-- Exact command / steps:
-- Observed result:
-- Not tested:
 
 ### Environment.
 
@@ -106,7 +105,7 @@ DTS dist/index.d.ts 12.72 KB
 
 ### Exact command / steps.
 
-1. Apply all 5 commits to a clean checkout of `plugins/openclaw` on top of `headroomlabs-ai/headroom:main`
+1. Apply all 8 commits to a clean checkout of `plugins/openclaw` on top of `headroomlabs-ai/headroom:main`
 2. `npm install && npm run build`
 3. Install via `openclaw plugins install --link dist --force --accept-capabilities --acknowledge-install-policy-warning`
 4. Set the plugin config in `~/.openclaw/openclaw.json` (see "Configuration" section below)
@@ -119,6 +118,8 @@ DTS dist/index.d.ts 12.72 KB
 - opencode-go (`opencode-go/mimo-v2.5`): requests routed through proxy with `x-headroom-base-url: https://opencode.ai/zen/go` and `x-opencode-session: <uuid>`, all 200 OK, returns coherent reply in ~7s
 - Per-turn compression measured: `tok_before=233435 tok_after=211938 tok_saved=21497` (9.2% on a single turn), `tok_before=432427 tok_after=382342` (11.6% on a heavier turn)
 - Overall: 432 requests through proxy, 5.58M tokens removed, 7.66% overall savings
+- Durable compaction: `openclaw sessions compact --max-lines 500` on an 888k-token fork session → ~97k tokens; `/compact` via Headroom proxy rewrites SQLite transcript instead of instant no-op
+- Assemble short-circuit: after trim, godot fork session (~97–170k tokens on 1M model) responds in ~17–58s with Headroom CPU near idle (assemble skip); before fix, every turn pegged proxy at 300%+ CPU for minutes
 
 ### Not tested.
 
@@ -199,8 +200,8 @@ Operators who do not want multi-upstream routing can omit `gatewayProviderIds` e
 - [x] I have commented my code, particularly in hard-to-understand areas
 - [x] I have made corresponding changes to the documentation (PR description includes "Configuration for operators" section + each commit message documents the rationale inline)
 - [x] My changes generate no new warnings (`npm run typecheck` clean, `npm run build` clean)
-- [x] I have added tests that prove my fix is effective or that my feature works (commit 5 adds 8 new test cases across two test files, and updates the existing tests that documented the old contract)
-- [x] New and existing unit tests pass locally with my changes (`npm test`: 84/84 passing)
+- [x] I have added tests that prove my fix is effective or that my feature works (commits 5–8 add compaction + assemble short-circuit tests; 89 total)
+- [x] New and existing unit tests pass locally with my changes (`npm test`: 89/89 passing)
 - [x] I did **not** edit `CHANGELOG.md` — it is generated by release-please from my Conventional Commit PR title (a CI guard enforces this)
 
 ## Additional Notes

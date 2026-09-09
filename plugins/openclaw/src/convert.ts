@@ -14,6 +14,32 @@
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
+/** Rough token estimate (~4 chars/token) for assemble budget short-circuit. */
+export function estimateRoughTokens(messages: any[]): number {
+  let chars = 0;
+  for (const msg of messages) {
+    const content = msg?.content;
+    if (typeof content === "string") {
+      chars += content.length;
+      continue;
+    }
+    if (Array.isArray(content)) {
+      for (const block of content) {
+        if (block?.type === "text" && typeof block.text === "string") {
+          chars += block.text.length;
+        } else {
+          chars += JSON.stringify(block).length;
+        }
+      }
+      continue;
+    }
+    if (content != null) {
+      chars += JSON.stringify(content).length;
+    }
+  }
+  return Math.max(1, Math.ceil(chars / 4));
+}
+
 export interface OpenAIMessage {
   role: string;
   content: string | null;

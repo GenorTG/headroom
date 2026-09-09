@@ -8,8 +8,21 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
 import { compress } from "headroom-ai";
+import {
+  applyCompactionPlan,
+  extractBranchMessages,
+  loadBranchMessagesFromSession,
+  planHeadroomCompaction,
+  resolveSessionTarget,
+  type PendingCompaction,
+} from "./compaction.js";
 import { ProxyManager, defaultLogger, type ProxyManagerConfig, type ProxyManagerLogger } from "./proxy-manager.js";
-import { agentToOpenAI, normalizeAgentMessages, openAIToAgent } from "./convert.js";
+import {
+  agentToOpenAI,
+  estimateRoughTokens,
+  normalizeAgentMessages,
+  openAIToAgent,
+} from "./convert.js";
 
 /** Race a promise against a timeout and always release the timer. */
 function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
@@ -70,6 +83,7 @@ export class HeadroomContextEngine {
     compactions: 0,
   };
   private circuit = { errors: 0, openUntilMs: 0 };
+  private pendingCompactions = new Map<string, PendingCompaction>();
 
   constructor(config: HeadroomEngineConfig = {}, logger?: ProxyManagerLogger) {
     this.config = config;
@@ -137,6 +151,22 @@ export class HeadroomContextEngine {
     }
 
     try {
+      const budget = params.tokenBudget;
+      if (budget != null && budget > 0) {
+        const roughTokens = estimateRoughTokens(params.messages);
+        // Skip proxy compression when context is clearly under budget — avoids
+        // multi-minute Kompress/tokenizer work on 100–200k sessions with 1M windows.
+        if (roughTokens < budget * 0.85) {
+          this.logger.debug(
+            `Assemble skip: ~${roughTokens} tokens under budget ${budget}`,
+          );
+          return {
+            messages: normalizeAgentMessages(params.messages),
+            estimatedTokens: roughTokens,
+          };
+        }
+      }
+
       // Convert AgentMessage → OpenAI format
       const openaiMessages = agentToOpenAI(params.messages);
 
@@ -201,10 +231,19 @@ export class HeadroomContextEngine {
    */
   async compact(params: {
     sessionId: string;
+    sessionKey?: string;
+    sessionTarget?: {
+      agentId?: string;
+      sessionId?: string;
+      sessionKey?: string;
+      storePath?: string;
+    };
     sessionFile: string;
     tokenBudget?: number;
     force?: boolean;
     runtimeContext?: any;
+    runtimeSettings?: { resolvedModel?: string | null; promptTokenBudget?: number };
+    abortSignal?: AbortSignal;
   }): Promise<{
     ok: boolean;
     compacted: boolean;
@@ -214,28 +253,134 @@ export class HeadroomContextEngine {
       tokensAfter?: number;
     };
   }> {
+    params.abortSignal?.throwIfAborted();
+
+    if (!this.proxyUrl) {
+      await this.ensureProxyUrl().catch(() => undefined);
+    }
     if (!this.proxyUrl) {
       return { ok: false, compacted: false, reason: "Proxy not available" };
     }
 
-    // Read current messages from session file if available
-    // For now, compact() works in tandem with assemble() — the next assemble()
-    // call will compress with the token budget. When compact() is called
-    // independently, we report success since our pipeline handles it.
-    //
-    // TODO: Read session file, extract messages, call compress() with tokenBudget,
-    //       write back compacted messages.
+    const sessionTarget = resolveSessionTarget(params);
+    const tokenBudget =
+      params.tokenBudget ??
+      params.runtimeContext?.tokenBudget ??
+      params.runtimeSettings?.promptTokenBudget;
 
     this.stats.compactions++;
     this.logger.info(
-      `Compact called (budget: ${params.tokenBudget ?? "none"}, force: ${params.force ?? false})`,
+      `Compact started (budget: ${tokenBudget ?? "none"}, force: ${params.force ?? false}, session: ${params.sessionId})`,
     );
 
-    return {
-      ok: true,
-      compacted: true,
-      reason: "Headroom applies SmartCrusher + Kompress + RollingWindow on next assemble()",
+    try {
+      const branchMessages = await loadBranchMessagesFromSession(
+        sessionTarget,
+        params.runtimeContext?.cwd ?? params.runtimeContext?.workspaceDir,
+      );
+      if (branchMessages.length === 0) {
+        return { ok: true, compacted: false, reason: "empty transcript" };
+      }
+
+      const plan = await planHeadroomCompaction({
+        branchMessages,
+        tokenBudget,
+        proxyUrl: this.proxyUrl,
+        model: params.runtimeSettings?.resolvedModel ?? undefined,
+        timeoutMs: this.config.requestTimeoutMs ?? 30_000,
+        abortSignal: params.abortSignal,
+        force: params.force === true,
+      });
+
+      if (plan.mode === "none") {
+        return {
+          ok: true,
+          compacted: false,
+          reason: "No durable compaction needed",
+          result: { tokensBefore: plan.tokensBefore, tokensAfter: plan.tokensAfter },
+        };
+      }
+
+      this.pendingCompactions.set(params.sessionId, {
+        sessionId: params.sessionId,
+        ...plan,
+      });
+
+      this.logger.info(
+        `Compact planned (${plan.mode}): ${plan.tokensBefore} → ${plan.tokensAfter} tokens`,
+      );
+
+      return {
+        ok: true,
+        compacted: true,
+        result: {
+          tokensBefore: plan.tokensBefore,
+          tokensAfter: plan.tokensAfter,
+        },
+      };
+    } catch (error) {
+      this.pendingCompactions.delete(params.sessionId);
+      this.logger.error(`Compact failed: ${error}`);
+      return {
+        ok: false,
+        compacted: false,
+        reason: String(error),
+      };
+    }
+  }
+
+  async maintain(params: {
+    sessionId: string;
+    sessionKey?: string;
+    sessionTarget?: {
+      agentId?: string;
+      sessionId?: string;
+      sessionKey?: string;
+      storePath?: string;
     };
+    sessionFile: string;
+    runtimeContext?: any;
+    abortSignal?: AbortSignal;
+  }): Promise<{
+    changed: boolean;
+    bytesFreed: number;
+    rewrittenEntries: number;
+    reason?: string;
+  }> {
+    params.abortSignal?.throwIfAborted();
+
+    const pending = this.pendingCompactions.get(params.sessionId);
+    if (!pending) {
+      return { changed: false, bytesFreed: 0, rewrittenEntries: 0, reason: "no pending compaction" };
+    }
+
+    this.pendingCompactions.delete(params.sessionId);
+
+    try {
+      const sessionTarget = resolveSessionTarget(params);
+      const result = await applyCompactionPlan({
+        sessionTarget,
+        plan: pending,
+        rewriteTranscriptEntries: params.runtimeContext?.rewriteTranscriptEntries,
+        cwd: params.runtimeContext?.cwd ?? params.runtimeContext?.workspaceDir,
+      });
+
+      if (result.changed) {
+        this.logger.info(
+          `Compact persisted: freed ~${result.bytesFreed} bytes across ${result.rewrittenEntries} entries`,
+        );
+      }
+
+      return result;
+    } catch (error) {
+      this.logger.error(`Compact maintenance failed: ${error}`);
+      return {
+        changed: false,
+        bytesFreed: 0,
+        rewrittenEntries: 0,
+        reason: String(error),
+      };
+    }
   }
 
   async afterTurn?(params: {
