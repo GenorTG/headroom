@@ -4,6 +4,10 @@ import {
   applyGatewayProviderBaseUrlsInPlace,
   resolveGatewayProviderIds,
 } from "../src/gateway-config.js";
+import {
+  buildGeminiGenerateContentRequestUrl,
+  matchesGeminiGenerateContentRoute,
+} from "../src/proxy-routing.js";
 import { __resetSessionIdCacheForTests } from "../src/session-headers.js";
 
 // The session-id cache is a module-level singleton so the production
@@ -69,7 +73,7 @@ describe("applyGatewayProviderBaseUrls", () => {
         models: [],
       },
       google: {
-        baseUrl: "http://127.0.0.1:8787/v1",
+        baseUrl: "http://127.0.0.1:8787/v1beta",
         models: [],
       },
       "minimax-portal": {
@@ -223,11 +227,7 @@ describe("applyGatewayProviderBaseUrls", () => {
     });
   });
 
-  it("normalizes a Gemini /v1beta upstream URL to /v1 on the proxy", () => {
-    // The proxy routes `/v1/projects/.../publishers/...` (Vertex AI).
-    // Gemini's /v1beta is not in the proxy's routing table; collapsing
-    // to /v1 is intentional because the operator is expected to wire
-    // `providerUpstreams` to the right Gemini-style URL.
+  it("preserves Gemini /v1beta upstream routing on the proxy", () => {
     const result = applyGatewayProviderBaseUrls(
       {
         models: {
@@ -243,10 +243,46 @@ describe("applyGatewayProviderBaseUrls", () => {
     );
 
     expect(result.changed).toBe(true);
-    expect((result.config as any).models.providers.google).toEqual({
-      baseUrl: "http://127.0.0.1:8787/v1",
-      models: [],
-    });
+    const googleBaseUrl = (result.config as any).models.providers.google.baseUrl;
+    expect(googleBaseUrl).toBe("http://127.0.0.1:8787/v1beta");
+
+    const requestUrl = buildGeminiGenerateContentRequestUrl(googleBaseUrl);
+    expect(matchesGeminiGenerateContentRoute(requestUrl)).toBe(true);
+  });
+
+  it("routes google without an explicit upstream baseUrl to /v1beta", () => {
+    const result = applyGatewayProviderBaseUrls({}, "http://127.0.0.1:8787", ["google"]);
+
+    expect(result.changed).toBe(true);
+    const googleBaseUrl = (result.config as any).models.providers.google.baseUrl;
+    expect(googleBaseUrl).toBe("http://127.0.0.1:8787/v1beta");
+    expect(
+      matchesGeminiGenerateContentRoute(
+        buildGeminiGenerateContentRequestUrl(googleBaseUrl),
+      ),
+    ).toBe(true);
+  });
+
+  it("routes OpenAI-compatible providers through /v1 chat/completions", () => {
+    const result = applyGatewayProviderBaseUrls(
+      {
+        models: {
+          providers: {
+            openai: {
+              baseUrl: "https://api.openai.com/v1",
+            },
+          },
+        },
+      },
+      "http://127.0.0.1:8787",
+      ["openai"],
+    );
+
+    const openaiBaseUrl = (result.config as any).models.providers.openai.baseUrl;
+    expect(openaiBaseUrl).toBe("http://127.0.0.1:8787/v1");
+    expect(new URL(`${openaiBaseUrl}/chat/completions`).pathname).toBe(
+      "/v1/chat/completions",
+    );
   });
 
   it("does not invent a GitHub Copilot proxy baseUrl without an upstream baseUrl", () => {

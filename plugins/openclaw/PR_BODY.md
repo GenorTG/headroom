@@ -55,6 +55,9 @@ Closes # (no upstream issue opened; surfaced from internal production use with m
   Adds `src/compaction.ts`: loads the active branch via OpenClaw `SessionManager`, calls Headroom `/v1/compress`, persists via `rewriteTranscriptEntries` or branch+truncate when noop/force. Wires real `compact()` and `maintain()` in `engine.ts`. Includes `test/compaction.test.ts` and `openclaw-agent-sessions.d.ts` for the plugin-sdk import.
 - **Commit 8** `Skip assemble compression when context is under token budget`
   Adds `estimateRoughTokens()` in `convert.ts` and a short-circuit in `assemble()` when `roughTokens < tokenBudget * 0.85`. Regression test in `engine.test.ts`. Production effect: 100–200k sessions on 1M models skip multi-minute proxy work; Headroom CPU drops to near-idle on those turns.
+- **Commit 9** `Durable commitTurn advancement and Gemini /v1beta routing` (review feedback)
+  - **P1:** Replaces the no-op `commitTurn()` with a durable, idempotent store keyed by `advancementKey`, using the OpenClaw contract field `messages` (not `acceptedTurn`). Persists to disk, returns `{ status: "duplicate" }` on retry, and includes restart/retry/failed-write tests.
+  - **P2:** Adds protocol-aware proxy pathname normalization via `resolveProxyPathPrefix()` — Gemini/Google providers keep `/v1beta` so requests reach `handle_gemini_generate_content`; OpenAI-compatible providers stay on `/v1`. Includes routing regression tests that assert generateContent URLs match the Gemini handler path.
 
 ## Testing
 
@@ -74,8 +77,8 @@ Closes # (no upstream issue opened; surfaced from internal production use with m
 ```
 $ npm test
 
- Test Files  7 passed (7)
-      Tests  89 passed (89)
+ Test Files  8 passed (8)
+      Tests  97 passed (97)
    Duration  ~1.2s
 ```
 

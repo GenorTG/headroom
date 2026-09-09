@@ -1,5 +1,6 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
+import { resolveProxyPathPrefix } from "./proxy-routing.js";
 import { ensureSessionId } from "./session-headers.js";
 
 /**
@@ -225,7 +226,9 @@ function routeBaseUrlThroughProxy(params: {
     // at a proxy-recognized route prefix.
     try {
       const proxy = new URL(params.proxyUrl);
-      proxy.pathname = "/v1";
+      proxy.pathname = resolveProxyPathPrefix({
+        providerId: params.providerId,
+      });
       return proxy.toString().replace(/\/$/, "");
     } catch {
       return params.proxyUrl;
@@ -235,20 +238,18 @@ function routeBaseUrlThroughProxy(params: {
   try {
     const proxy = new URL(params.proxyUrl);
     const upstream = new URL(upstreamBaseUrl);
-    // Normalize the rewritten proxy URL's pathname to "/v1" so it always
-    // matches one of the proxy's recognized route prefixes
-    // (`/v1/messages`, `/v1/chat/completions`, `/v1/responses`,
-    // `/anthropic/v1/messages`, ...). Third-party providers whose first-
-    // party URL is not /v1-rooted (OpenRouter at `/api/v1`, opencode-go
-    // at `/zen/go/v1`, Venice at `/api/v1`, ...) otherwise end up at a
-    // proxy URL whose path matches nothing and the proxy returns 404.
+    // Normalize the rewritten proxy URL's pathname to a proxy-recognized
+    // route prefix. OpenAI-compatible providers use `/v1/...`; Gemini native
+    // traffic must keep `/v1beta/...` so requests reach
+    // `handle_gemini_generate_content` instead of the generic passthrough.
     //
     // Per-provider upstream targeting is handled separately via the
-    // `x-headroom-base-url` request header (added in a preceding
-    // commit), so collapsing the proxy pathname here loses no
-    // information: the proxy forwards to `<header value>` + the request
-    // path, not to the rewritten proxy URL + the request path.
-    proxy.pathname = "/v1";
+    // `x-headroom-base-url` request header, so collapsing the proxy pathname
+    // here loses no upstream information.
+    proxy.pathname = resolveProxyPathPrefix({
+      providerId: params.providerId,
+      upstreamBaseUrl,
+    });
     proxy.search = upstream.search;
     proxy.hash = "";
     return proxy.toString().replace(/\/$/, "");
