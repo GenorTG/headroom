@@ -66,6 +66,9 @@ describe("TurnAdvancementStore", () => {
       }),
     ).toBe("duplicate");
     expect(second.has("turn-restart")).toBe(true);
+
+    const persisted = JSON.parse(readFileSync(storePath, "utf8"));
+    expect(persisted.records["turn-restart"].messages).toEqual(messages);
   });
 
   it("throws when a retry presents the same key with different messages", () => {

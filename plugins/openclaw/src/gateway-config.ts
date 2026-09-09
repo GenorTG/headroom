@@ -222,8 +222,7 @@ function routeBaseUrlThroughProxy(params: {
     // No upstream URL is configured for this provider (e.g. a built-in
     // bundled provider with a hard-coded DEFAULT entry that we didn't
     // match, or a provider id that simply doesn't have a baseUrl yet).
-    // Normalize the proxy pathname to "/v1" anyway so the request lands
-    // at a proxy-recognized route prefix.
+    // Normalize the proxy pathname to a provider-recognized route prefix.
     try {
       const proxy = new URL(params.proxyUrl);
       proxy.pathname = resolveProxyPathPrefix({
