@@ -1,3 +1,6 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 const mocked = vi.hoisted(() => ({
@@ -270,17 +273,54 @@ describe("HeadroomContextEngine proxy startup helpers", () => {
     );
   });
 
-  it("commitTurn returns the durable-advancement status contract", async () => {
-    const engine = new HeadroomContextEngine();
-    const result = await engine.commitTurn({
+  describe("commitTurn durable advancement", () => {
+    const tempDirs: string[] = [];
+
+    afterEach(() => {
+      for (const dir of tempDirs.splice(0)) {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    function makeEngine() {
+      const dir = mkdtempSync(join(tmpdir(), "headroom-engine-commit-"));
+      tempDirs.push(dir);
+      return new HeadroomContextEngine({
+        turnAdvancementStorePath: join(dir, "turn-advancements.json"),
+      });
+    }
+
+    const commitParams = {
       sessionId: "session-1",
       advancementKey: "turn-1",
-      acceptedTurn: {},
+      messages: [{ role: "user", content: "hello" }],
+    };
+
+    it("returns committed on first write and duplicate on retry", async () => {
+      const engine = makeEngine();
+
+      await expect(engine.commitTurn(commitParams)).resolves.toEqual({
+        status: "committed",
+      });
+      await expect(engine.commitTurn(commitParams)).resolves.toEqual({
+        status: "duplicate",
+      });
     });
-    // OpenClaw 2026.9.x deletes the durable turn outbox row only when the
-    // result carries a recognized `status` ("committed" | "duplicate").
-    // A bare `{ committed: true }` leaves the advancement key stuck and
-    // degrades the engine to legacy for every following turn.
-    expect(result.status).toBe("committed");
+
+    it("persists across new engine instances after restart", async () => {
+      const dir = mkdtempSync(join(tmpdir(), "headroom-engine-restart-"));
+      tempDirs.push(dir);
+      const storePath = join(dir, "turn-advancements.json");
+
+      const first = new HeadroomContextEngine({ turnAdvancementStorePath: storePath });
+      await expect(first.commitTurn(commitParams)).resolves.toEqual({
+        status: "committed",
+      });
+
+      const second = new HeadroomContextEngine({ turnAdvancementStorePath: storePath });
+      await expect(second.commitTurn(commitParams)).resolves.toEqual({
+        status: "duplicate",
+      });
+    });
   });
 });

@@ -18,6 +18,10 @@ import {
 } from "./compaction.js";
 import { ProxyManager, defaultLogger, type ProxyManagerConfig, type ProxyManagerLogger } from "./proxy-manager.js";
 import {
+  TurnAdvancementStore,
+  resolveTurnAdvancementStorePath,
+} from "./turn-advancement-store.js";
+import {
   agentToOpenAI,
   estimateRoughTokens,
   normalizeAgentMessages,
@@ -40,6 +44,8 @@ export interface HeadroomEngineConfig extends ProxyManagerConfig {
   requestTimeoutMs?: number;
   circuitBreakerThreshold?: number;
   circuitBreakerCooldownMs?: number;
+  /** Override durable turn-advancement store path (primarily for tests). */
+  turnAdvancementStorePath?: string;
 }
 
 export class HeadroomContextEngine {
@@ -84,6 +90,7 @@ export class HeadroomContextEngine {
   };
   private circuit = { errors: 0, openUntilMs: 0 };
   private pendingCompactions = new Map<string, PendingCompaction>();
+  private turnAdvancementStores = new Map<string, TurnAdvancementStore>();
 
   constructor(config: HeadroomEngineConfig = {}, logger?: ProxyManagerLogger) {
     this.config = config;
@@ -410,24 +417,38 @@ export class HeadroomContextEngine {
 
   /**
    * Atomic + idempotent turn commit. OpenClaw calls this once the run for
-   * a logical turn completes successfully; the engine must acknowledge by
-   * either committing the turn (so retries collapse to the same record)
-   * or rejecting it. Because headroom does not own the canonical transcript
-   * (compression is the only transformation we apply, and the runtime
-   * persists messages itself), we always accept the turn and return
-   * immediately. The runtime then proceeds to the next logical turn.
+   * a logical turn completes successfully. We persist the accepted messages
+   * keyed by advancementKey so host retries and gateway restarts collapse to
+   * the same record even though OpenClaw owns the canonical transcript.
    */
   async commitTurn(params: {
     sessionId: string;
+    sessionKey?: string;
     advancementKey: string;
-    acceptedTurn: unknown;
-  }): Promise<{ status: "committed" | "duplicate"; reason?: string }> {
-    // OpenClaw 2026.9.x requires `status: "committed"` (or `"duplicate"`)
-    // from commitTurn; the outbox row is deleted only when the runtime sees a
-    // recognized status. Returning `{ committed: true }` (old shape) leaves the
-    // advancement key stuck in the durable turn outbox, which degrades this
-    // engine to legacy for every subsequent turn and blocks assemble().
-    return { status: "committed", reason: "compression-only engine; transcript owned by OpenClaw runtime" };
+    messages: unknown[];
+    admission?: unknown;
+    terminal?: unknown;
+    sessionTarget?: {
+      agentId?: string;
+      sessionId?: string;
+      sessionKey?: string;
+      storePath?: string;
+    };
+    runtimeSettings?: unknown;
+    runtimeContext?: unknown;
+    isHeartbeat?: boolean;
+  }): Promise<{ status: "committed" | "duplicate" }> {
+    const storePath = resolveTurnAdvancementStorePath({
+      sessionTarget: params.sessionTarget,
+      turnAdvancementStorePath: this.config.turnAdvancementStorePath,
+    });
+    const store = this.getTurnAdvancementStore(storePath);
+    const status = store.commit({
+      advancementKey: params.advancementKey,
+      sessionId: params.sessionId,
+      messages: params.messages,
+    });
+    return { status };
   }
 
   async dispose(): Promise<void> {
@@ -523,6 +544,15 @@ export class HeadroomContextEngine {
       throw new Error("Headroom proxy startup is disabled");
     }
     return this.proxyStartupPromise;
+  }
+
+  private getTurnAdvancementStore(storePath: string): TurnAdvancementStore {
+    let store = this.turnAdvancementStores.get(storePath);
+    if (!store) {
+      store = new TurnAdvancementStore({ storePath });
+      this.turnAdvancementStores.set(storePath, store);
+    }
+    return store;
   }
 
   private async notifyProxyReady(proxyUrl: string): Promise<void> {

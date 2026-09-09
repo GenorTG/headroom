@@ -162,7 +162,7 @@ describe("headroomPlugin runtime routing", () => {
       models: [],
     });
     expect(api.config.models.providers.google).toEqual({
-      baseUrl: "http://127.0.0.1:8787/v1",
+      baseUrl: "http://127.0.0.1:8787/v1beta",
       models: [],
     });
     expect(api.config.models.providers.openrouter).toEqual({
