@@ -16,6 +16,24 @@ This PR addresses five related issues in the headroom OpenClaw plugin:
 
 Closes # (no upstream issue opened; surfaced from internal production use with minimax-portal/MiniMax-M3 against Minimax's anthropic-compat endpoint at api.minimax.io, OpenRouter, and opencode-go).
 
+## Response to review (@JerrettDavis, commits `3209280` + `9b0f778`)
+
+Thanks for the detailed review on `656ea3f`. Both blockers are addressed in the latest push:
+
+### [P1] Durable `commitTurn` — fixed
+
+- `commitTurn()` now accepts the real OpenClaw payload field **`messages`** (not `acceptedTurn`).
+- Adds `TurnAdvancementStore` (`src/turn-advancement-store.ts`): atomically persists the accepted **`messages`** keyed by `advancementKey` to disk (next to the session store).
+- First write → `{ status: "committed" }`; same key + same messages on retry or after gateway restart → `{ status: "duplicate" }`.
+- Tests: retry, new engine instance after restart, key conflict, failed persist (no partial state). See `test/turn-advancement-store.test.ts` and `test/engine.test.ts`.
+
+### [P2] Gemini `/v1beta` routing — fixed
+
+- Replaced unconditional `proxy.pathname = "/v1"` with protocol-aware `resolveProxyPathPrefix()` (`src/proxy-routing.ts`).
+- **`google` / `gemini`** providers rewrite to `http://<proxy>/v1beta`, matching Google's official endpoint (`generativelanguage.googleapis.com/v1beta/models/{model}:generateContent`) and Headroom's `handle_gemini_generate_content` route.
+- OpenAI-compatible providers still normalize to `/v1`.
+- Routing regression test builds the full `generateContent` URL and asserts it matches the Gemini handler path (not just the rewritten base string).
+
 **Before this PR:**
 - 0% input compression on OpenClaw 2026.9.x (compression engine bypassed per turn)
 - Each OpenAI-compatible upstream needs its own headroom proxy instance
@@ -55,8 +73,8 @@ Closes # (no upstream issue opened; surfaced from internal production use with m
   Adds `src/compaction.ts`: loads the active branch via OpenClaw `SessionManager`, calls Headroom `/v1/compress`, persists via `rewriteTranscriptEntries` or branch+truncate when noop/force. Wires real `compact()` and `maintain()` in `engine.ts`. Includes `test/compaction.test.ts` and `openclaw-agent-sessions.d.ts` for the plugin-sdk import.
 - **Commit 8** `Skip assemble compression when context is under token budget`
   Adds `estimateRoughTokens()` in `convert.ts` and a short-circuit in `assemble()` when `roughTokens < tokenBudget * 0.85`. Regression test in `engine.test.ts`. Production effect: 100–200k sessions on 1M models skip multi-minute proxy work; Headroom CPU drops to near-idle on those turns.
-- **Commit 9** `Durable commitTurn advancement and Gemini /v1beta routing` (review feedback)
-  - **P1:** Replaces the no-op `commitTurn()` with a durable, idempotent store keyed by `advancementKey`, using the OpenClaw contract field `messages` (not `acceptedTurn`). Persists to disk, returns `{ status: "duplicate" }` on retry, and includes restart/retry/failed-write tests.
+- **Commit 9–10** `Durable commitTurn advancement and Gemini /v1beta routing` (review feedback)
+  - **P1:** Replaces the no-op `commitTurn()` with a durable, idempotent store keyed by `advancementKey`, using the OpenClaw contract field `messages` (not `acceptedTurn`). Persists the full accepted `messages` payload to disk, returns `{ status: "duplicate" }` on retry, and includes restart/retry/failed-write tests.
   - **P2:** Adds protocol-aware proxy pathname normalization via `resolveProxyPathPrefix()` — Gemini/Google providers keep `/v1beta` so requests reach `handle_gemini_generate_content`; OpenAI-compatible providers stay on `/v1`. Includes routing regression tests that assert generateContent URLs match the Gemini handler path.
 
 ## Testing
