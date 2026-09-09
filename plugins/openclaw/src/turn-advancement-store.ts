@@ -11,6 +11,7 @@ import { dirname, join } from "node:path";
 
 export interface TurnAdvancementRecord {
   advancementKey: string;
+  messages: unknown[];
   messagesDigest: string;
   sessionId: string;
   committedAtMs: number;
@@ -76,6 +77,7 @@ export class TurnAdvancementStore {
 
     const record: TurnAdvancementRecord = {
       advancementKey: params.advancementKey,
+      messages: params.messages,
       messagesDigest: digest,
       sessionId: params.sessionId,
       committedAtMs: Date.now(),

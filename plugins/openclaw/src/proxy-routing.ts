@@ -38,7 +38,7 @@ export function resolveProxyPathPrefix(params: {
 
 export function buildGeminiGenerateContentRequestUrl(
   providerBaseUrl: string,
-  model = "gemini-2.0-flash",
+  model = "gemini-2.5-flash",
 ): string {
   const base = providerBaseUrl.replace(/\/$/, "");
   return `${base}/models/${model}:generateContent`;
