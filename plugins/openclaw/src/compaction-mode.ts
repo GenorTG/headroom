@@ -1,5 +1,5 @@
 /** How Headroom handles durable `/compact` and overflow-recovery compaction. */
-export type PersistentCompactionMode = "headroom" | "openclaw";
+export type PersistentCompactionMode = "headroom" | "openclaw" | "hybrid";
 
 export interface PersistentCompactionConfig {
   /** @deprecated Prefer `persistentCompaction`. */
@@ -7,7 +7,7 @@ export interface PersistentCompactionConfig {
   persistentCompaction?: PersistentCompactionMode | boolean;
 }
 
-/** Resolve configured durable compaction ownership (default: Headroom). */
+/** Resolve configured durable compaction ownership (default: openclaw — matches upstream delegation). */
 export function resolvePersistentCompactionMode(
   config: PersistentCompactionConfig = {},
 ): PersistentCompactionMode {
@@ -19,9 +19,12 @@ export function resolvePersistentCompactionMode(
   if (persistentCompaction === "headroom" || persistentCompaction === true) {
     return "headroom";
   }
+  if (persistentCompaction === "hybrid") {
+    return "hybrid";
+  }
   if (persistentCompaction !== undefined) {
     throw new Error(
-      `Invalid headroom persistentCompaction value: ${String(persistentCompaction)} (expected "headroom" or "openclaw")`,
+      `Invalid headroom persistentCompaction value: ${String(persistentCompaction)} (expected "headroom", "openclaw", or "hybrid")`,
     );
   }
 
@@ -32,9 +35,13 @@ export function resolvePersistentCompactionMode(
     return "headroom";
   }
 
-  return "headroom";
+  return "openclaw";
 }
 
 export function ownsPersistentCompaction(mode: PersistentCompactionMode): boolean {
   return mode === "headroom";
+}
+
+export function delegatesPersistentCompaction(mode: PersistentCompactionMode): boolean {
+  return mode === "openclaw" || mode === "hybrid";
 }

@@ -62,8 +62,7 @@ Install automatically selects the `contextEngine` slot for `headroom` on current
       "headroom": {
         "enabled": true,
         "config": {
-          "proxyUrl": "http://127.0.0.1:8787",
-          "persistentCompaction": "headroom"
+          "proxyUrl": "http://127.0.0.1:8787"
         }
       }
     },
@@ -87,8 +86,9 @@ Headroom always compresses **per-turn model input** via `assemble()`. Durable tr
 
 | `persistentCompaction` | `/compact` behavior | LLM cost |
 |---|---|---|
-| `"headroom"` (default) | Headroom `/v1/compress` rewrites SQLite | Zero |
-| `"openclaw"` | Delegates to OpenClaw native compaction | Config-dependent |
+| `"openclaw"` (default) | OpenClaw native compaction only (`ownsCompaction: false`) | Config-dependent |
+| `"hybrid"` | Headroom replace pre-pass, then OpenClaw LLM compact | Config-dependent |
+| `"headroom"` | Headroom `/v1/compress` rewrites SQLite | Zero |
 
 ```json
 {
@@ -96,7 +96,11 @@ Headroom always compresses **per-turn model input** via `assemble()`. Durable tr
     "entries": {
       "headroom": {
         "config": {
-          "persistentCompaction": "headroom"
+          "persistentCompaction": "hybrid",
+          "transcriptHygiene": {
+            "enabled": true,
+            "softThresholdTokens": 400000
+          }
         }
       }
     }
@@ -104,7 +108,9 @@ Headroom always compresses **per-turn model input** via `assemble()`. Durable tr
 }
 ```
 
-Use `"openclaw"` to match upstream Headroom `main` after #2304. Use `"headroom"` for zero-LLM durable compaction on large tool-heavy sessions.
+**Hybrid (opt-in, for large tool-heavy sessions):** Headroom algorithmically shrinks tool blobs in SQLite (replace-only, no truncate) on turn-end and before `/compact`, then OpenClaw safeguard summarization handles the big history prune. OpenClaw owns durable compaction (`ownsCompaction: false`), avoiding mid-turn transcript ownership errors.
+
+Default `"openclaw"` matches upstream Headroom `main` delegation after #2304. Use `"hybrid"` when you want Headroom replace hygiene plus OpenClaw LLM compact (recommended for large tool-heavy deployments). Use `"headroom"` for zero-LLM durable compaction only.
 
 ### Upstream gateway routing
 
@@ -241,7 +247,7 @@ Compression is lossless via CCR (Compress-Cache-Retrieve): originals are stored 
 
 | | lossless-claw | headroom |
 |---|---|---|
-| Compaction method | LLM summarization (DAG) | Configurable: Headroom durable (`persistentCompaction: "headroom"`, default) or OpenClaw native (`"openclaw"`) |
+| Compaction method | LLM summarization (DAG) | Configurable: OpenClaw native (`"openclaw"`, default), hybrid (`"hybrid"`), or Headroom durable (`"headroom"`) |
 | Cost of compaction | Tokens (LLM calls) | Headroom mode: zero LLM; OpenClaw mode: config-dependent |
 | Best for | Long conversations | Tool-heavy agents with large outputs |
 | Retrieval | `lcm_grep`, `lcm_expand` | `headroom_retrieve` (instant) |

@@ -52,7 +52,11 @@
     },
     "persistentCompaction": {
       "label": "Persistent Compaction Mode",
-      "help": "How /compact and overflow recovery rewrite the SQLite transcript. \"headroom\" (default): algorithmic durable compaction via Headroom /v1/compress (zero LLM). \"openclaw\": delegate to OpenClaw native compaction (LLM summarization / safeguard). Per-turn assemble() compression always uses Headroom in both modes."
+      "help": "How /compact and overflow recovery rewrite the SQLite transcript. \"openclaw\" (default): OpenClaw native compaction only — matches upstream delegation (ownsCompaction=false). \"hybrid\": Headroom replace pre-pass, then OpenClaw LLM compaction. \"headroom\": algorithmic durable compaction via Headroom /v1/compress (zero LLM). Per-turn assemble() always uses Headroom."
+    },
+    "transcriptHygiene": {
+      "label": "Transcript Hygiene",
+      "help": "Turn-end in-place Headroom replace on tool-heavy messages (no truncate). Enabled by default in hybrid mode. Object form: { enabled, softThresholdTokens }."
     },
     "durableCompaction": {
       "label": "Durable Compaction (deprecated)",
@@ -141,8 +145,21 @@
       },
       "persistentCompaction": {
         "type": "string",
-        "enum": ["headroom", "openclaw"],
-        "default": "headroom"
+        "enum": ["hybrid", "headroom", "openclaw"],
+        "default": "openclaw"
+      },
+      "transcriptHygiene": {
+        "oneOf": [
+          { "type": "boolean" },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "enabled": { "type": "boolean" },
+              "softThresholdTokens": { "type": "integer", "minimum": 1 }
+            }
+          }
+        ]
       },
       "durableCompaction": {
         "type": "boolean"

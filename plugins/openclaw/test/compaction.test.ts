@@ -161,7 +161,7 @@ describe("HeadroomContextEngine durable compaction", () => {
       },
     ]);
 
-    const engine = new HeadroomContextEngine();
+    const engine = new HeadroomContextEngine({ persistentCompaction: "headroom" });
     (engine as { proxyUrl: string | null }).proxyUrl = "http://127.0.0.1:8787";
 
     await expect(
@@ -200,7 +200,7 @@ describe("HeadroomContextEngine durable compaction", () => {
       rewrittenEntries: 1,
     }));
 
-    const engine = new HeadroomContextEngine();
+    const engine = new HeadroomContextEngine({ persistentCompaction: "headroom" });
     (engine as { proxyUrl: string | null }).proxyUrl = "http://127.0.0.1:8787";
 
     const compactResult = await engine.compact({
