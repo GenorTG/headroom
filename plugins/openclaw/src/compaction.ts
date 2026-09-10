@@ -372,11 +372,10 @@ export async function applyCompactionPlan(options: {
       return total + estimateMessageBytes(entry.message);
     }, 0);
 
-  if (options.plan.truncateParentId) {
-    sessionManager.branch(options.plan.truncateParentId);
-  } else {
-    sessionManager.resetLeaf();
-  }
+  // Truncate must drop the prefix, not branch from an ancestor. OpenClaw's
+  // branch(parentId) keeps the full path to that parent; resetLeaf() starts a
+  // fresh tail so only appendMessages remain on the active branch.
+  sessionManager.resetLeaf();
 
   for (const message of appendMessages) {
     sessionManager.appendMessage(message);
