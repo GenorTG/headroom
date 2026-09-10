@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 const mocked = vi.hoisted(() => ({
+  delegateCompactionToRuntime: vi.fn(),
   start: vi.fn(async () => "http://127.0.0.1:8787"),
   stop: vi.fn(async () => undefined),
   logger: {
@@ -16,6 +17,10 @@ const mocked = vi.hoisted(() => ({
 
 vi.mock("headroom-ai", () => ({
   compress: vi.fn(),
+}));
+
+vi.mock("../src/openclaw-compaction.js", () => ({
+  delegateCompactionToRuntime: mocked.delegateCompactionToRuntime,
 }));
 
 vi.mock("../src/proxy-manager.js", () => ({
@@ -31,6 +36,7 @@ import { compress } from "headroom-ai";
 
 afterEach(() => {
   vi.mocked(compress).mockReset();
+  mocked.delegateCompactionToRuntime.mockReset();
   mocked.start.mockReset();
   mocked.start.mockResolvedValue("http://127.0.0.1:8787");
   mocked.stop.mockClear();
@@ -38,6 +44,79 @@ afterEach(() => {
   mocked.logger.error.mockClear();
   mocked.logger.info.mockClear();
   mocked.logger.warn.mockClear();
+});
+
+describe("HeadroomContextEngine persistent compaction mode", () => {
+  it("defaults to headroom-owned durable compaction", () => {
+    const engine = new HeadroomContextEngine();
+    expect(engine.info.ownsCompaction).toBe(true);
+    expect(engine.info).toHaveProperty("transcriptSemantics");
+  });
+
+  it("delegates persistent compaction to OpenClaw when configured", async () => {
+    const engine = new HeadroomContextEngine({ persistentCompaction: "openclaw" });
+    const params = {
+      sessionId: "session-1",
+      sessionKey: "agent:main:session-1",
+      sessionFile: "session.jsonl",
+      tokenBudget: 120_000,
+      force: false,
+    };
+    const delegatedResult = {
+      ok: true,
+      compacted: true,
+      result: {
+        tokensBefore: 20_000,
+        tokensAfter: 8_000,
+      },
+    };
+    mocked.delegateCompactionToRuntime.mockResolvedValueOnce(delegatedResult);
+
+    expect(engine.info.ownsCompaction).toBe(false);
+    expect(engine.info).not.toHaveProperty("transcriptSemantics");
+    await expect(engine.compact(params)).resolves.toEqual(delegatedResult);
+    expect(mocked.delegateCompactionToRuntime).toHaveBeenCalledWith(params);
+    expect(compress).not.toHaveBeenCalled();
+    expect(engine.getStats().compactions).toBe(1);
+  });
+
+  it("does not count a delegated no-op as a compaction", async () => {
+    const engine = new HeadroomContextEngine({ persistentCompaction: "openclaw" });
+    mocked.delegateCompactionToRuntime.mockResolvedValueOnce({
+      ok: true,
+      compacted: false,
+      reason: "Below compaction threshold",
+    });
+
+    await expect(
+      engine.compact({
+        sessionId: "session-1",
+        sessionKey: "agent:main:session-1",
+      }),
+    ).resolves.toEqual({
+      ok: true,
+      compacted: false,
+      reason: "Below compaction threshold",
+    });
+
+    expect(engine.getStats().compactions).toBe(0);
+  });
+
+  it("propagates delegated compaction failures without reporting success", async () => {
+    const engine = new HeadroomContextEngine({ persistentCompaction: "openclaw" });
+    const failure = new Error("native compaction failed");
+    mocked.delegateCompactionToRuntime.mockRejectedValueOnce(failure);
+
+    await expect(
+      engine.compact({
+        sessionId: "session-1",
+        sessionKey: "agent:main:session-1",
+      }),
+    ).rejects.toBe(failure);
+
+    expect(engine.getStats().compactions).toBe(0);
+    expect(mocked.logger.info).not.toHaveBeenCalled();
+  });
 });
 
 describe("HeadroomContextEngine proxy startup helpers", () => {

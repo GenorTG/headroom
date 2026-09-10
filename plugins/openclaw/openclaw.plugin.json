@@ -49,6 +49,14 @@
     "providerSessionHeaders": {
       "label": "Provider Session Headers",
       "help": "Optional map from OpenClaw provider id to a header name. The headroom plugin generates a per-process UUID and injects it under that header on requests to the provider, so OpenAI-compatible third-party APIs that route via a server-side session/accounting layer (e.g. opencode-go's x-opencode-session) can identify the session without the caller having to thread a session id through every chat-completions call."
+    },
+    "persistentCompaction": {
+      "label": "Persistent Compaction Mode",
+      "help": "How /compact and overflow recovery rewrite the SQLite transcript. \"headroom\" (default): algorithmic durable compaction via Headroom /v1/compress (zero LLM). \"openclaw\": delegate to OpenClaw native compaction (LLM summarization / safeguard). Per-turn assemble() compression always uses Headroom in both modes."
+    },
+    "durableCompaction": {
+      "label": "Durable Compaction (deprecated)",
+      "help": "Deprecated alias for persistentCompaction. true = headroom, false = openclaw."
     }
   },
   "configSchema": {
@@ -130,6 +138,14 @@
           "pattern": "^[A-Za-z0-9-]+$"
         },
         "default": {}
+      },
+      "persistentCompaction": {
+        "type": "string",
+        "enum": ["headroom", "openclaw"],
+        "default": "headroom"
+      },
+      "durableCompaction": {
+        "type": "boolean"
       }
     }
   },
