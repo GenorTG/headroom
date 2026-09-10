@@ -62,7 +62,8 @@ Install automatically selects the `contextEngine` slot for `headroom` on current
       "headroom": {
         "enabled": true,
         "config": {
-          "proxyUrl": "http://127.0.0.1:8787"
+          "proxyUrl": "http://127.0.0.1:8787",
+          "persistentCompaction": "headroom"
         }
       }
     },
@@ -79,6 +80,31 @@ Install automatically selects the `contextEngine` slot for `headroom` on current
 
 Default `proxyPort` is `8787`. Auto-start is opt-in; in production, prefer an externally
 managed proxy such as systemd with `proxyUrl` set and `autoStart: false`.
+
+### Persistent compaction mode
+
+Headroom always compresses **per-turn model input** via `assemble()`. Durable transcript compaction (`/compact`, overflow recovery) is configurable:
+
+| `persistentCompaction` | `/compact` behavior | LLM cost |
+|---|---|---|
+| `"headroom"` (default) | Headroom `/v1/compress` rewrites SQLite | Zero |
+| `"openclaw"` | Delegates to OpenClaw native compaction | Config-dependent |
+
+```json
+{
+  "plugins": {
+    "entries": {
+      "headroom": {
+        "config": {
+          "persistentCompaction": "headroom"
+        }
+      }
+    }
+  }
+}
+```
+
+Use `"openclaw"` to match upstream Headroom `main` after #2304. Use `"headroom"` for zero-LLM durable compaction on large tool-heavy sessions.
 
 ### Upstream gateway routing
 
@@ -215,8 +241,8 @@ Compression is lossless via CCR (Compress-Cache-Retrieve): originals are stored 
 
 | | lossless-claw | headroom |
 |---|---|---|
-| Compaction method | LLM summarization (DAG) | OpenClaw native compaction (delegated) |
-| Cost of compaction | Tokens (LLM calls) | OpenClaw configuration-dependent |
+| Compaction method | LLM summarization (DAG) | Configurable: Headroom durable (`persistentCompaction: "headroom"`, default) or OpenClaw native (`"openclaw"`) |
+| Cost of compaction | Tokens (LLM calls) | Headroom mode: zero LLM; OpenClaw mode: config-dependent |
 | Best for | Long conversations | Tool-heavy agents with large outputs |
 | Retrieval | `lcm_grep`, `lcm_expand` | `headroom_retrieve` (instant) |
 

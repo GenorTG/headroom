@@ -27,6 +27,33 @@ import {
   normalizeAgentMessages,
   openAIToAgent,
 } from "./convert.js";
+import {
+  ownsPersistentCompaction,
+  resolvePersistentCompactionMode,
+  type PersistentCompactionConfig,
+  type PersistentCompactionMode,
+} from "./compaction-mode.js";
+import {
+  delegateCompactionToRuntime,
+  type OpenClawCompactParams,
+  type OpenClawCompactResult,
+} from "./openclaw-compaction.js";
+
+type HeadroomCompactParams = OpenClawCompactParams & {
+  sessionTarget?: {
+    agentId?: string;
+    sessionId?: string;
+    sessionKey?: string;
+    storePath?: string;
+  };
+  runtimeContext?: {
+    tokenBudget?: number;
+    cwd?: string;
+    workspaceDir?: string;
+    rewriteTranscriptEntries?: unknown;
+  };
+  runtimeSettings?: { resolvedModel?: string | null; promptTokenBudget?: number };
+};
 
 /** Race a promise against a timeout and always release the timer. */
 function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
@@ -39,7 +66,7 @@ function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   });
 }
 
-export interface HeadroomEngineConfig extends ProxyManagerConfig {
+export interface HeadroomEngineConfig extends ProxyManagerConfig, PersistentCompactionConfig {
   enabled?: boolean;
   requestTimeoutMs?: number;
   circuitBreakerThreshold?: number;
@@ -49,35 +76,29 @@ export interface HeadroomEngineConfig extends ProxyManagerConfig {
 }
 
 export class HeadroomContextEngine {
-  readonly info = {
-    id: "headroom",
-    name: "Headroom Context Compression",
-    version: "0.1.0",
-    ownsCompaction: true,
-    // OpenClaw 2026.9.x added a durable-turn contract for context engines: any
-    // engine that participates in admitted-turn lifecycle must declare its
-    // fencing semantics so the runtime knows how to read prior transcripts
-    // before this engine runs, and so turn advancement can be replayed
-    // safely on retry. Engines that don't declare this contract are still
-    // loaded but are bypassed per logical turn in favor of the legacy
-    // engine — which silently disables `assemble()` and the SmartCrusher
-    // transforms on every turn.
-    //
-    // headroom is a compression-only engine that does not own the canonical
-    // transcript (OpenClaw's runtime persists messages). We fence on the
-    // user-entry boundary so the runtime commits admitted turns up to and
-    // including the user entry but excludes the assistant response under
-    // construction, and we declare atomic-idempotent advancement so
-    // retries collapse to the same turn record.
-    transcriptSemantics: {
-      currentTurnFence: "before-current-turn-entry-v1",
-      turnAdvancementIdempotency: "atomic-idempotent-v1",
-    },
-  };
+  get info() {
+    const ownsCompaction = ownsPersistentCompaction(this.persistentCompactionMode);
+    return {
+      id: "headroom",
+      name: "Headroom Context Compression",
+      version: "0.1.0",
+      ownsCompaction,
+      ...(ownsCompaction
+        ? {
+            // OpenClaw 2026.9.x durable-turn contract for engines that own compaction.
+            transcriptSemantics: {
+              currentTurnFence: "before-current-turn-entry-v1",
+              turnAdvancementIdempotency: "atomic-idempotent-v1",
+            },
+          }
+        : {}),
+    };
+  }
 
   private proxyManager: ProxyManager;
   private proxyUrl: string | null = null;
   private config: HeadroomEngineConfig;
+  private readonly persistentCompactionMode: PersistentCompactionMode;
   private logger: ProxyManagerLogger;
   private proxyReadyListeners = new Set<(proxyUrl: string) => void | Promise<void>>();
   private proxyStartupPromise: Promise<string> | null = null;
@@ -94,6 +115,7 @@ export class HeadroomContextEngine {
 
   constructor(config: HeadroomEngineConfig = {}, logger?: ProxyManagerLogger) {
     this.config = config;
+    this.persistentCompactionMode = resolvePersistentCompactionMode(config);
     this.logger = logger ?? defaultLogger;
     this.proxyManager = new ProxyManager(config, this.logger);
   }
@@ -226,41 +248,25 @@ export class HeadroomContextEngine {
   }
 
   /**
-   * Compact context — zero-cost alternative to LLM summarization.
+   * Durable compaction (`/compact`, overflow recovery).
    *
-   * Calls compress() with the token budget, which triggers:
-   * - SmartCrusher: aggressive JSON compression (70-90% on tool outputs)
-   * - Kompress: ModernBERT text compression (40-60% on assistant text)
-   * - RollingWindow: drops oldest messages if still over budget
-   * - CCR: stores originals for retrieval via headroom_retrieve tool
-   *
-   * Zero LLM calls. All algorithmic.
+   * - `persistentCompaction: "headroom"` (default): rewrite SQLite via Headroom `/v1/compress` (zero LLM).
+   * - `persistentCompaction: "openclaw"`: delegate to OpenClaw native compaction (LLM summarization).
    */
-  async compact(params: {
-    sessionId: string;
-    sessionKey?: string;
-    sessionTarget?: {
-      agentId?: string;
-      sessionId?: string;
-      sessionKey?: string;
-      storePath?: string;
-    };
-    sessionFile: string;
-    tokenBudget?: number;
-    force?: boolean;
-    runtimeContext?: any;
-    runtimeSettings?: { resolvedModel?: string | null; promptTokenBudget?: number };
-    abortSignal?: AbortSignal;
-  }): Promise<{
-    ok: boolean;
-    compacted: boolean;
-    reason?: string;
-    result?: {
-      tokensBefore: number;
-      tokensAfter?: number;
-    };
-  }> {
+  async compact(params: OpenClawCompactParams): Promise<OpenClawCompactResult> {
     params.abortSignal?.throwIfAborted();
+
+    if (this.persistentCompactionMode === "openclaw") {
+      const result = await delegateCompactionToRuntime(params);
+      if (result.compacted) {
+        this.stats.compactions++;
+      }
+      this.logger.info(
+        `Compaction ${result.compacted ? "completed" : "skipped"} ` +
+          `(delegated to OpenClaw, budget: ${params.tokenBudget ?? "none"}, force: ${params.force ?? false})`,
+      );
+      return result;
+    }
 
     if (!this.proxyUrl) {
       await this.ensureProxyUrl().catch(() => undefined);
@@ -269,21 +275,22 @@ export class HeadroomContextEngine {
       return { ok: false, compacted: false, reason: "Proxy not available" };
     }
 
-    const sessionTarget = resolveSessionTarget(params);
+    const headroomParams = params as HeadroomCompactParams;
+    const sessionTarget = resolveSessionTarget(headroomParams);
     const tokenBudget =
-      params.tokenBudget ??
-      params.runtimeContext?.tokenBudget ??
-      params.runtimeSettings?.promptTokenBudget;
+      headroomParams.tokenBudget ??
+      headroomParams.runtimeContext?.tokenBudget ??
+      headroomParams.runtimeSettings?.promptTokenBudget;
 
     this.stats.compactions++;
     this.logger.info(
-      `Compact started (budget: ${tokenBudget ?? "none"}, force: ${params.force ?? false}, session: ${params.sessionId})`,
+      `Compact started (budget: ${tokenBudget ?? "none"}, force: ${headroomParams.force ?? false}, session: ${headroomParams.sessionId})`,
     );
 
     try {
       const branchMessages = await loadBranchMessagesFromSession(
         sessionTarget,
-        params.runtimeContext?.cwd ?? params.runtimeContext?.workspaceDir,
+        headroomParams.runtimeContext?.cwd ?? headroomParams.runtimeContext?.workspaceDir,
       );
       if (branchMessages.length === 0) {
         return { ok: true, compacted: false, reason: "empty transcript" };
@@ -293,10 +300,10 @@ export class HeadroomContextEngine {
         branchMessages,
         tokenBudget,
         proxyUrl: this.proxyUrl,
-        model: params.runtimeSettings?.resolvedModel ?? undefined,
+        model: headroomParams.runtimeSettings?.resolvedModel ?? undefined,
         timeoutMs: this.config.requestTimeoutMs ?? 30_000,
-        abortSignal: params.abortSignal,
-        force: params.force === true,
+        abortSignal: headroomParams.abortSignal,
+        force: headroomParams.force === true,
       });
 
       if (plan.mode === "none") {
@@ -308,8 +315,8 @@ export class HeadroomContextEngine {
         };
       }
 
-      this.pendingCompactions.set(params.sessionId, {
-        sessionId: params.sessionId,
+      this.pendingCompactions.set(headroomParams.sessionId, {
+        sessionId: headroomParams.sessionId,
         ...plan,
       });
 
@@ -326,7 +333,7 @@ export class HeadroomContextEngine {
         },
       };
     } catch (error) {
-      this.pendingCompactions.delete(params.sessionId);
+      this.pendingCompactions.delete(headroomParams.sessionId);
       this.logger.error(`Compact failed: ${error}`);
       return {
         ok: false,
@@ -355,6 +362,15 @@ export class HeadroomContextEngine {
     reason?: string;
   }> {
     params.abortSignal?.throwIfAborted();
+
+    if (this.persistentCompactionMode === "openclaw") {
+      return {
+        changed: false,
+        bytesFreed: 0,
+        rewrittenEntries: 0,
+        reason: "persistent compaction delegated to OpenClaw",
+      };
+    }
 
     const pending = this.pendingCompactions.get(params.sessionId);
     if (!pending) {
