@@ -5,6 +5,13 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 const mocked = vi.hoisted(() => ({
   delegateCompactionToRuntime: vi.fn(),
+  runTranscriptReplaceHygiene: vi.fn(async () => ({
+    changed: true,
+    bytesFreed: 512,
+    rewrittenEntries: 2,
+    tokensBefore: 50_000,
+    tokensAfter: 44_000,
+  })),
   start: vi.fn(async () => "http://127.0.0.1:8787"),
   stop: vi.fn(async () => undefined),
   logger: {
@@ -23,6 +30,14 @@ vi.mock("../src/openclaw-compaction.js", () => ({
   delegateCompactionToRuntime: mocked.delegateCompactionToRuntime,
 }));
 
+vi.mock("../src/transcript-hygiene.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/transcript-hygiene.js")>();
+  return {
+    ...actual,
+    runTranscriptReplaceHygiene: mocked.runTranscriptReplaceHygiene,
+  };
+});
+
 vi.mock("../src/proxy-manager.js", () => ({
   ProxyManager: class {
     start = mocked.start;
@@ -37,6 +52,14 @@ import { compress } from "headroom-ai";
 afterEach(() => {
   vi.mocked(compress).mockReset();
   mocked.delegateCompactionToRuntime.mockReset();
+  mocked.runTranscriptReplaceHygiene.mockReset();
+  mocked.runTranscriptReplaceHygiene.mockResolvedValue({
+    changed: true,
+    bytesFreed: 512,
+    rewrittenEntries: 2,
+    tokensBefore: 50_000,
+    tokensAfter: 44_000,
+  });
   mocked.start.mockReset();
   mocked.start.mockResolvedValue("http://127.0.0.1:8787");
   mocked.stop.mockClear();
@@ -47,10 +70,62 @@ afterEach(() => {
 });
 
 describe("HeadroomContextEngine persistent compaction mode", () => {
-  it("defaults to headroom-owned durable compaction", () => {
+  it("defaults to openclaw compaction (OpenClaw owns durable compact)", () => {
     const engine = new HeadroomContextEngine();
-    expect(engine.info.ownsCompaction).toBe(true);
-    expect(engine.info).toHaveProperty("transcriptSemantics");
+    expect(engine.info.ownsCompaction).toBe(false);
+    expect(engine.info.transcriptSemantics).toEqual({
+      currentTurnFence: "before-current-turn-entry-v1",
+      turnAdvancementIdempotency: "atomic-idempotent-v1",
+    });
+  });
+
+  it("runs hygiene pre-pass then delegates when hybrid compact is requested", async () => {
+    const engine = new HeadroomContextEngine({ persistentCompaction: "hybrid" });
+    (engine as { proxyUrl: string | null }).proxyUrl = "http://127.0.0.1:8787";
+    const params = {
+      sessionId: "session-1",
+      sessionKey: "agent:main:session-1",
+      sessionFile: "session.jsonl",
+      tokenBudget: 120_000,
+      force: true,
+    };
+    const delegatedResult = {
+      ok: true,
+      compacted: true,
+      result: { tokensBefore: 20_000, tokensAfter: 8_000 },
+    };
+    mocked.delegateCompactionToRuntime.mockResolvedValueOnce(delegatedResult);
+
+    await expect(engine.compact(params)).resolves.toEqual(delegatedResult);
+    expect(mocked.runTranscriptReplaceHygiene).toHaveBeenCalledWith(
+      expect.objectContaining({ force: true, proxyUrl: "http://127.0.0.1:8787" }),
+    );
+    expect(mocked.delegateCompactionToRuntime).toHaveBeenCalledWith(params);
+    expect(engine.getStats().compactions).toBe(1);
+    expect(engine.getStats().hygieneRuns).toBe(1);
+  });
+
+  it("runs turn-end hygiene in maintain() for hybrid mode", async () => {
+    const engine = new HeadroomContextEngine({ persistentCompaction: "hybrid" });
+    (engine as { proxyUrl: string | null }).proxyUrl = "http://127.0.0.1:8787";
+
+    await expect(
+      engine.maintain({
+        sessionId: "session-1",
+        sessionKey: "agent:main:session-1",
+        sessionFile: "session.jsonl",
+      }),
+    ).resolves.toEqual({
+      changed: true,
+      bytesFreed: 512,
+      rewrittenEntries: 2,
+      tokensBefore: 50_000,
+      tokensAfter: 44_000,
+    });
+
+    expect(mocked.runTranscriptReplaceHygiene).toHaveBeenCalledWith(
+      expect.objectContaining({ force: false }),
+    );
   });
 
   it("delegates persistent compaction to OpenClaw when configured", async () => {
@@ -73,7 +148,9 @@ describe("HeadroomContextEngine persistent compaction mode", () => {
     mocked.delegateCompactionToRuntime.mockResolvedValueOnce(delegatedResult);
 
     expect(engine.info.ownsCompaction).toBe(false);
-    expect(engine.info).not.toHaveProperty("transcriptSemantics");
+    expect(engine.info.transcriptSemantics?.currentTurnFence).toBe(
+      "before-current-turn-entry-v1",
+    );
     await expect(engine.compact(params)).resolves.toEqual(delegatedResult);
     expect(mocked.delegateCompactionToRuntime).toHaveBeenCalledWith(params);
     expect(compress).not.toHaveBeenCalled();

@@ -209,6 +209,25 @@ For each provider that requires a session/accounting header (opencode-go's `x-op
 
 Operators who do not want multi-upstream routing can omit `gatewayProviderIds` entirely; the stock `["openai-codex"]` default still applies.
 
+## Merge safety / default behavior
+
+**Upstream `main` today:** `ownsCompaction: false`, OpenClaw owns durable `/compact`, Headroom only runs per-turn `assemble()`.
+
+**This PR without any `persistentCompaction` config:**
+- Default **`"openclaw"`** — same durable-compaction delegation as upstream (`ownsCompaction: false`)
+- **`transcriptSemantics` always declared** — required on OpenClaw 2026.9.x so `assemble()` is not degraded to legacy every turn (bug fix, not a behavior change operators opt into)
+- **`transcriptHygiene` off** unless mode is `"hybrid"` or explicitly enabled
+- Per-turn `assemble()` budget short-circuit unchanged from earlier commits (skips proxy when clearly under budget)
+
+**Opt-in modes (no surprise for stock installs):**
+| Mode | When to use |
+|------|-------------|
+| `"openclaw"` (default) | Match upstream; OpenClaw LLM compact only |
+| `"hybrid"` | Headroom replace pre-pass + turn-end hygiene + OpenClaw compact (large tool-heavy sessions) |
+| `"headroom"` | Zero-LLM durable compaction via Headroom `/v1/compress` (`ownsCompaction: true`) |
+
+Production deployments that want hybrid should set `"persistentCompaction": "hybrid"` explicitly (not implied by plugin defaults).
+
 ## Review Readiness
 
 - [x] I have performed a self-review

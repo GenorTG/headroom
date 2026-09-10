@@ -10,7 +10,6 @@
 import { compress } from "headroom-ai";
 import {
   applyCompactionPlan,
-  extractBranchMessages,
   loadBranchMessagesFromSession,
   planHeadroomCompaction,
   resolveSessionTarget,
@@ -28,6 +27,7 @@ import {
   openAIToAgent,
 } from "./convert.js";
 import {
+  delegatesPersistentCompaction,
   ownsPersistentCompaction,
   resolvePersistentCompactionMode,
   type PersistentCompactionConfig,
@@ -38,6 +38,13 @@ import {
   type OpenClawCompactParams,
   type OpenClawCompactResult,
 } from "./openclaw-compaction.js";
+import {
+  resolveSoftThresholdTokens,
+  resolveTranscriptHygieneSettings,
+  runTranscriptReplaceHygiene,
+  type TranscriptHygieneConfig,
+  type TranscriptHygieneRuntimeParams,
+} from "./transcript-hygiene.js";
 
 type HeadroomCompactParams = OpenClawCompactParams & {
   sessionTarget?: {
@@ -50,7 +57,9 @@ type HeadroomCompactParams = OpenClawCompactParams & {
     tokenBudget?: number;
     cwd?: string;
     workspaceDir?: string;
-    rewriteTranscriptEntries?: unknown;
+    rewriteTranscriptEntries?: (request: {
+      replacements: Array<{ entryId: string; message: unknown }>;
+    }) => Promise<{ changed: boolean; bytesFreed: number; rewrittenEntries: number }>;
   };
   runtimeSettings?: { resolvedModel?: string | null; promptTokenBudget?: number };
 };
@@ -66,7 +75,8 @@ function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   });
 }
 
-export interface HeadroomEngineConfig extends ProxyManagerConfig, PersistentCompactionConfig {
+export interface HeadroomEngineConfig
+  extends ProxyManagerConfig, PersistentCompactionConfig, TranscriptHygieneConfig {
   enabled?: boolean;
   requestTimeoutMs?: number;
   circuitBreakerThreshold?: number;
@@ -74,6 +84,12 @@ export interface HeadroomEngineConfig extends ProxyManagerConfig, PersistentComp
   /** Override durable turn-advancement store path (primarily for tests). */
   turnAdvancementStorePath?: string;
 }
+
+/** OpenClaw 2026.9.x turn contract — required even when OpenClaw owns compaction (hybrid/openclaw). */
+const HEADROOM_TRANSCRIPT_SEMANTICS = {
+  currentTurnFence: "before-current-turn-entry-v1" as const,
+  turnAdvancementIdempotency: "atomic-idempotent-v1" as const,
+};
 
 export class HeadroomContextEngine {
   get info() {
@@ -83,15 +99,7 @@ export class HeadroomContextEngine {
       name: "Headroom Context Compression",
       version: "0.1.0",
       ownsCompaction,
-      ...(ownsCompaction
-        ? {
-            // OpenClaw 2026.9.x durable-turn contract for engines that own compaction.
-            transcriptSemantics: {
-              currentTurnFence: "before-current-turn-entry-v1",
-              turnAdvancementIdempotency: "atomic-idempotent-v1",
-            },
-          }
-        : {}),
+      transcriptSemantics: HEADROOM_TRANSCRIPT_SEMANTICS,
     };
   }
 
@@ -108,7 +116,10 @@ export class HeadroomContextEngine {
     totalTokensSaved: 0,
     totalTokensBefore: 0,
     compactions: 0,
+    hygieneRuns: 0,
+    hygieneBytesFreed: 0,
   };
+  private readonly transcriptHygieneSettings: ReturnType<typeof resolveTranscriptHygieneSettings>;
   private circuit = { errors: 0, openUntilMs: 0 };
   private pendingCompactions = new Map<string, PendingCompaction>();
   private turnAdvancementStores = new Map<string, TurnAdvancementStore>();
@@ -116,6 +127,10 @@ export class HeadroomContextEngine {
   constructor(config: HeadroomEngineConfig = {}, logger?: ProxyManagerLogger) {
     this.config = config;
     this.persistentCompactionMode = resolvePersistentCompactionMode(config);
+    this.transcriptHygieneSettings = resolveTranscriptHygieneSettings(
+      config,
+      this.persistentCompactionMode,
+    );
     this.logger = logger ?? defaultLogger;
     this.proxyManager = new ProxyManager(config, this.logger);
   }
@@ -250,22 +265,18 @@ export class HeadroomContextEngine {
   /**
    * Durable compaction (`/compact`, overflow recovery).
    *
-   * - `persistentCompaction: "headroom"` (default): rewrite SQLite via Headroom `/v1/compress` (zero LLM).
-   * - `persistentCompaction: "openclaw"`: delegate to OpenClaw native compaction (LLM summarization).
+   * - `persistentCompaction: "hybrid"` (default): Headroom replace pre-pass, then OpenClaw LLM compact.
+   * - `persistentCompaction: "headroom"`: rewrite SQLite via Headroom `/v1/compress` (zero LLM).
+   * - `persistentCompaction: "openclaw"`: delegate to OpenClaw native compaction only.
    */
   async compact(params: OpenClawCompactParams): Promise<OpenClawCompactResult> {
     params.abortSignal?.throwIfAborted();
 
-    if (this.persistentCompactionMode === "openclaw") {
-      const result = await delegateCompactionToRuntime(params);
-      if (result.compacted) {
-        this.stats.compactions++;
+    if (delegatesPersistentCompaction(this.persistentCompactionMode)) {
+      if (this.persistentCompactionMode === "hybrid") {
+        await this.runTranscriptHygienePass(params as HeadroomCompactParams, { force: true });
       }
-      this.logger.info(
-        `Compaction ${result.compacted ? "completed" : "skipped"} ` +
-          `(delegated to OpenClaw, budget: ${params.tokenBudget ?? "none"}, force: ${params.force ?? false})`,
-      );
-      return result;
+      return this.delegateOpenClawCompaction(params);
     }
 
     if (!this.proxyUrl) {
@@ -363,13 +374,19 @@ export class HeadroomContextEngine {
   }> {
     params.abortSignal?.throwIfAborted();
 
-    if (this.persistentCompactionMode === "openclaw") {
-      return {
-        changed: false,
-        bytesFreed: 0,
-        rewrittenEntries: 0,
-        reason: "persistent compaction delegated to OpenClaw",
-      };
+    if (this.persistentCompactionMode !== "headroom") {
+      if (!this.transcriptHygieneSettings.enabled) {
+        return {
+          changed: false,
+          bytesFreed: 0,
+          rewrittenEntries: 0,
+          reason:
+            this.persistentCompactionMode === "hybrid"
+              ? "transcript hygiene disabled"
+              : "persistent compaction delegated to OpenClaw",
+        };
+      }
+      return this.runTranscriptHygienePass(params, { force: false });
     }
 
     const pending = this.pendingCompactions.get(params.sessionId);
@@ -578,6 +595,91 @@ export class HeadroomContextEngine {
       } catch (error) {
         this.logger.warn(`Headroom proxy ready listener failed: ${error}`);
       }
+    }
+  }
+
+  private async delegateOpenClawCompaction(
+    params: OpenClawCompactParams,
+  ): Promise<OpenClawCompactResult> {
+    const result = await delegateCompactionToRuntime(params);
+    if (result.compacted) {
+      this.stats.compactions++;
+    }
+    this.logger.info(
+      `Compaction ${result.compacted ? "completed" : "skipped"} ` +
+        `(delegated to OpenClaw, mode: ${this.persistentCompactionMode}, budget: ${params.tokenBudget ?? "none"}, force: ${params.force ?? false})`,
+    );
+    return result;
+  }
+
+  private async runTranscriptHygienePass(
+    params: HeadroomCompactParams & {
+      sessionKey?: string;
+      sessionTarget?: HeadroomCompactParams["sessionTarget"];
+      sessionFile?: string;
+    },
+    options: { force: boolean },
+  ): Promise<{ changed: boolean; bytesFreed: number; rewrittenEntries: number; reason?: string }> {
+    if (!this.transcriptHygieneSettings.enabled && !options.force) {
+      return {
+        changed: false,
+        bytesFreed: 0,
+        rewrittenEntries: 0,
+        reason: "transcript hygiene disabled",
+      };
+    }
+
+    if (!this.proxyUrl) {
+      await this.ensureProxyUrl().catch(() => undefined);
+    }
+    if (!this.proxyUrl) {
+      return {
+        changed: false,
+        bytesFreed: 0,
+        rewrittenEntries: 0,
+        reason: "Proxy not available",
+      };
+    }
+
+    const tokenBudget =
+      params.tokenBudget ??
+      params.runtimeContext?.tokenBudget ??
+      params.runtimeSettings?.promptTokenBudget;
+    const softThresholdTokens = resolveSoftThresholdTokens(
+      this.transcriptHygieneSettings,
+      tokenBudget,
+    );
+
+    try {
+      const result = await runTranscriptReplaceHygiene({
+        params: params as TranscriptHygieneRuntimeParams,
+        proxyUrl: this.proxyUrl,
+        timeoutMs: this.config.requestTimeoutMs ?? 30_000,
+        softThresholdTokens,
+        force: options.force,
+        model: params.runtimeSettings?.resolvedModel ?? undefined,
+      });
+
+      if (result.changed) {
+        this.stats.hygieneRuns++;
+        this.stats.hygieneBytesFreed += result.bytesFreed;
+        this.logger.info(
+          `Transcript hygiene: freed ~${result.bytesFreed} bytes across ${result.rewrittenEntries} entries` +
+            (result.tokensBefore !== undefined
+              ? ` (${result.tokensBefore} → ${result.tokensAfter ?? result.tokensBefore} tokens)`
+              : ""),
+        );
+      }
+
+      return result;
+    } catch (error) {
+      this.logger.warn(`Transcript hygiene failed: ${error}`);
+      return {
+        changed: false,
+        bytesFreed: 0,
+        rewrittenEntries: 0,
+        reason: String(error),
+      };
     }
   }
 }
