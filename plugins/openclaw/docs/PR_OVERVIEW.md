@@ -60,7 +60,7 @@ paths or credentials.
 
 ### Tests
 
-See [TEST_MATRIX.md](./TEST_MATRIX.md). Summary: **208+ unit/integration tests**, optional live proxy stress scripts.
+See [TEST_MATRIX.md](./TEST_MATRIX.md). Summary: **224 vitest cases** across 16 files, plus optional live proxy stress scripts.
 
 ## Merge with upstream `main` (2026-09-11)
 
