@@ -249,6 +249,8 @@ Compression is lossless via CCR (Compress-Cache-Retrieve): originals are stored 
 | `transcriptProjectionWaitMs` | `120000` | Max wait after hygiene rewrites for OpenClaw transcript projection rebuild to settle. `0` disables waiting. |
 | `transcriptHygiene.debounceMs` | `30000` | Per-session debounce window for turn-end hygiene and hybrid compact pre-passes. Prevents stacked SQLite rewrites within seconds. |
 | `assembleCompressConfig` | `{ protect_recent: 2 }` | Per-turn `/v1/compress` config for `assemble()`. Default protects the last two messages from aggressive inline compression. |
+| `assembleSkipBudgetRatio` | `0.7` | `assemble()` skips proxy compression while the history's rough token estimate is below `(tokenBudget − assembleReserveTokens) × ratio`. Range (0, 1]. |
+| `assembleReserveTokens` | `20000` | Subtracted from `tokenBudget` before the ratio. OpenClaw passes the full model window as `tokenBudget`, but its prompt also carries the system prompt, tool schemas and a ≥ 20k compaction reserve, and its overflow precheck counts all of them. Agents with large system prompts (memory, skills, many tools) should set this to roughly `reserve + system prompt tokens` (e.g. `60000`) so Headroom compresses before native compaction kicks in. |
 | `skipAssembleWhenGatewayRouted` | `false` | When `true`, skip `assemble()` compression for models whose provider is in `gatewayProviderIds` (their live requests already pass through the proxy — prevents double compression). Providers that are not routed still get `assemble()` compression. If the provider is unknown the skip applies. |
 
 ### Proxy env mitigations (operator config)

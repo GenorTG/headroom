@@ -82,6 +82,39 @@ function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   });
 }
 
+export const DEFAULT_ASSEMBLE_SKIP_BUDGET_RATIO = 0.7;
+export const DEFAULT_ASSEMBLE_RESERVE_TOKENS = 20_000;
+
+/** Non-negative integer reserve; invalid values fall back to the default. */
+export function resolveAssembleReserveTokens(value: number | undefined): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+    return DEFAULT_ASSEMBLE_RESERVE_TOKENS;
+  }
+  return Math.floor(value);
+}
+
+/**
+ * Token count below which `assemble()` skips proxy compression:
+ * `(tokenBudget − reserve) × ratio`, never below 1.
+ */
+export function resolveAssembleSkipThreshold(params: {
+  tokenBudget: number;
+  ratio?: number;
+  reserveTokens?: number;
+}): number {
+  const ratio = resolveAssembleSkipBudgetRatio(params.ratio);
+  const reserve = resolveAssembleReserveTokens(params.reserveTokens);
+  return Math.max(1, Math.round((params.tokenBudget - reserve) * ratio));
+}
+
+/** Clamp a configured skip ratio into (0, 1]; invalid values fall back to the default. */
+export function resolveAssembleSkipBudgetRatio(value: number | undefined): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0 || value > 1) {
+    return DEFAULT_ASSEMBLE_SKIP_BUDGET_RATIO;
+  }
+  return value;
+}
+
 export interface HeadroomEngineConfig
   extends ProxyManagerConfig, PersistentCompactionConfig, TranscriptHygieneConfig {
   enabled?: boolean;
@@ -97,6 +130,24 @@ export interface HeadroomEngineConfig
   turnAdvancementStorePath?: string;
   /** Per-turn `/v1/compress` config (default: `{ protect_recent: 2 }`). */
   assembleCompressConfig?: CompressRequestConfig;
+  /**
+   * `assemble()` skips proxy compression while the rough token estimate of the
+   * history is below `tokenBudget * assembleSkipBudgetRatio`. OpenClaw's own
+   * overflow precheck fires at roughly `budget - reserve - systemPrompt`, so
+   * this must sit low enough that compression runs before native compaction on
+   * ~200k windows, yet high enough that 100–200k sessions in 1M windows are not
+   * compressed on every turn. Range (0, 1]; default 0.7.
+   */
+  assembleSkipBudgetRatio?: number;
+  /**
+   * Tokens subtracted from `tokenBudget` before the skip ratio is applied.
+   * OpenClaw hands `assemble()` the full model window as `tokenBudget`, but
+   * the prompt it actually builds also carries the system prompt, tool schemas
+   * and a compaction reserve (≥ 20 000 tokens). Set this to roughly
+   * `reserve + system prompt tokens` so compression starts before the native
+   * overflow precheck. Default 20 000 (OpenClaw's reserve floor).
+   */
+  assembleReserveTokens?: number;
   /**
    * Skip `assemble()` compression when the current model's provider is routed
    * through the proxy via `gatewayProviderIds` (avoids double compression — see
@@ -241,9 +292,14 @@ export class HeadroomContextEngine {
         const roughTokens = estimateRoughTokens(params.messages);
         // Skip proxy compression when context is clearly under budget — avoids
         // multi-minute Kompress/tokenizer work on 100–200k sessions with 1M windows.
-        if (roughTokens < budget * 0.85) {
+        const skipThreshold = resolveAssembleSkipThreshold({
+          tokenBudget: budget,
+          ratio: this.config.assembleSkipBudgetRatio,
+          reserveTokens: this.config.assembleReserveTokens,
+        });
+        if (roughTokens < skipThreshold) {
           this.logger.debug(
-            `Assemble skip: ~${roughTokens} tokens under budget ${budget}`,
+            `Assemble skip: ~${roughTokens} tokens under threshold ${Math.round(skipThreshold)} (budget ${budget})`,
           );
           return {
             messages: normalizeAgentMessages(params.messages),

@@ -70,6 +70,14 @@
       "label": "Assemble Compress Config",
       "help": "Optional /v1/compress config for per-turn assemble() compression. Default includes protect_recent: 2 so recent tool turns are preserved. Passed to the Headroom proxy via the headroom-ai SDK."
     },
+    "assembleSkipBudgetRatio": {
+      "label": "Assemble Skip Budget Ratio",
+      "help": "assemble() skips proxy compression while the history's rough token estimate is below tokenBudget × this ratio. Default 0.7 so compression runs before OpenClaw's native overflow compaction (which triggers near budget − reserve − system prompt) on ~200k windows, while 100–200k sessions in 1M windows are left untouched. Range (0, 1]."
+    },
+    "assembleReserveTokens": {
+      "label": "Assemble Reserve Tokens",
+      "help": "Tokens subtracted from tokenBudget before the skip ratio is applied. OpenClaw passes the full model window as tokenBudget but its prompt also carries the system prompt, tool schemas and a compaction reserve (≥ 20000). Set to roughly reserve + system prompt tokens so compression starts before native overflow compaction. Default 20000."
+    },
     "skipAssembleWhenGatewayRouted": {
       "label": "Skip Assemble When Gateway Routed",
       "help": "When true and gatewayProviderIds is non-empty, skip assemble() compression because live provider traffic already passes through the Headroom proxy (avoids double compression). Default: false."
@@ -191,6 +199,17 @@
           "compress_user_messages": { "type": "boolean" },
           "frozen_message_count": { "type": "integer", "minimum": 0 }
         }
+      },
+      "assembleSkipBudgetRatio": {
+        "type": "number",
+        "exclusiveMinimum": 0,
+        "maximum": 1,
+        "default": 0.7
+      },
+      "assembleReserveTokens": {
+        "type": "integer",
+        "minimum": 0,
+        "default": 20000
       },
       "skipAssembleWhenGatewayRouted": {
         "type": "boolean",
