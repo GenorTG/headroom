@@ -56,11 +56,23 @@
     },
     "transcriptHygiene": {
       "label": "Transcript Hygiene",
-      "help": "Turn-end in-place Headroom replace on tool-heavy messages (no truncate). Enabled by default in hybrid mode. Object form: { enabled, softThresholdTokens }."
+      "help": "Turn-end in-place Headroom replace on tool-heavy messages (no truncate). Enabled by default in hybrid mode. Object form: { enabled, softThresholdTokens, debounceMs }."
+    },
+    "transcriptProjectionWaitMs": {
+      "label": "Transcript Projection Wait",
+      "help": "Milliseconds to wait for OpenClaw SQLite transcript projection to settle after hygiene rewrites. Set 0 to disable. Default: 120000."
     },
     "durableCompaction": {
       "label": "Durable Compaction (deprecated)",
       "help": "Deprecated alias for persistentCompaction. true = headroom, false = openclaw."
+    },
+    "assembleCompressConfig": {
+      "label": "Assemble Compress Config",
+      "help": "Optional /v1/compress config for per-turn assemble() compression. Default includes protect_recent: 2 so recent tool turns are preserved. Passed to the Headroom proxy via the headroom-ai SDK."
+    },
+    "skipAssembleWhenGatewayRouted": {
+      "label": "Skip Assemble When Gateway Routed",
+      "help": "When true and gatewayProviderIds is non-empty, skip assemble() compression because live provider traffic already passes through the Headroom proxy (avoids double compression). Default: false."
     }
   },
   "configSchema": {
@@ -156,13 +168,33 @@
             "additionalProperties": false,
             "properties": {
               "enabled": { "type": "boolean" },
-              "softThresholdTokens": { "type": "integer", "minimum": 1 }
+              "softThresholdTokens": { "type": "integer", "minimum": 1 },
+              "debounceMs": { "type": "integer", "minimum": 0, "default": 30000 }
             }
           }
         ]
       },
+      "transcriptProjectionWaitMs": {
+        "type": "integer",
+        "minimum": 0,
+        "default": 120000
+      },
       "durableCompaction": {
         "type": "boolean"
+      },
+      "assembleCompressConfig": {
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+          "protect_recent": { "type": "integer", "minimum": 0 },
+          "mode": { "type": "string" },
+          "compress_user_messages": { "type": "boolean" },
+          "frozen_message_count": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "skipAssembleWhenGatewayRouted": {
+        "type": "boolean",
+        "default": false
       }
     }
   },

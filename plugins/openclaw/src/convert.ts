@@ -49,6 +49,123 @@ export interface OpenAIMessage {
   _headroomMeta?: Record<string, unknown>;
 }
 
+/** Prefix for structured toolResult block arrays in OpenAI tool message content. */
+export const TOOL_CONTENT_BLOCKS_PREFIX = "__HR_TOOL_BLOCKS__";
+
+/** Prefix for structured user content block arrays in OpenAI user message content. */
+export const USER_CONTENT_BLOCKS_PREFIX = "__HR_USER_BLOCKS__";
+
+/** True when a message carries multimodal or tool payloads that must not be lossy-rewritten. */
+function blockIsProtectedPayload(block: unknown): boolean {
+  if (!isRecord(block) || typeof block.type !== "string") return false;
+  return (
+    block.type === "image" ||
+    block.type === "toolCall" ||
+    block.type === "tool_use" ||
+    block.type === "tool_result"
+  );
+}
+
+export function messageHasProtectedToolPayload(message: any): boolean {
+  if (!isRecord(message)) return false;
+  const role = message.role;
+  if (
+    role !== "toolResult" &&
+    role !== "tool_result" &&
+    role !== "assistant" &&
+    role !== "user"
+  ) {
+    return false;
+  }
+  const content = message.content;
+  if (!Array.isArray(content)) return false;
+  return content.some((block) => blockIsProtectedPayload(block));
+}
+
+/** Serialize normalized toolResult blocks for OpenAI tool role (string content only). */
+export function serializeToolResultBlocks(blocks: any[]): string {
+  if (blocks.length === 0) return "";
+  if (blocks.length === 1 && blocks[0]?.type === "text" && typeof blocks[0].text === "string") {
+    return blocks[0].text;
+  }
+  const textOnly = blocks.every(
+    (block) => block?.type === "text" && typeof block.text === "string",
+  );
+  if (textOnly) {
+    return blocks.map((block) => block.text).join("\n");
+  }
+  return `${TOOL_CONTENT_BLOCKS_PREFIX}${JSON.stringify(blocks)}`;
+}
+
+/** Restore block arrays from OpenAI string content and preserved metadata. */
+export function deserializeStructuredContent(
+  content: string | null | undefined,
+  meta: Record<string, unknown>,
+  options: {
+    prefix: string;
+    metaKey: "toolContentBlocks" | "userContentBlocks";
+  },
+): any[] {
+  const trimmed = typeof content === "string" ? content : "";
+  if (trimmed.startsWith(options.prefix)) {
+    try {
+      const parsed = JSON.parse(trimmed.slice(options.prefix.length));
+      if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+    } catch {
+      // fall through to meta / plain text
+    }
+  }
+
+  const fromMeta = meta[options.metaKey];
+  if (Array.isArray(fromMeta) && fromMeta.length > 0) {
+    const metaHasStructured = fromMeta.some(
+      (block) => isRecord(block) && block.type !== "text",
+    );
+    if (metaHasStructured || !trimmed) {
+      return fromMeta;
+    }
+  }
+
+  return [{ type: "text", text: trimmed }];
+}
+
+/** Restore toolResult blocks from OpenAI tool content and preserved metadata. */
+export function deserializeToolResultContent(
+  content: string | null | undefined,
+  meta: Record<string, unknown>,
+): any[] {
+  return deserializeStructuredContent(content, meta, {
+    prefix: TOOL_CONTENT_BLOCKS_PREFIX,
+    metaKey: "toolContentBlocks",
+  });
+}
+
+/** Restore user content blocks from OpenAI user content and preserved metadata. */
+export function deserializeUserContent(
+  content: string | null | undefined,
+  meta: Record<string, unknown>,
+): any[] {
+  return deserializeStructuredContent(content, meta, {
+    prefix: USER_CONTENT_BLOCKS_PREFIX,
+    metaKey: "userContentBlocks",
+  });
+}
+
+/** Serialize normalized user content blocks for OpenAI user role (string content only). */
+export function serializeUserContentBlocks(blocks: any[]): string {
+  if (blocks.length === 0) return "";
+  if (blocks.length === 1 && blocks[0]?.type === "text" && typeof blocks[0].text === "string") {
+    return blocks[0].text;
+  }
+  const textOnly = blocks.every(
+    (block) => block?.type === "text" && typeof block.text === "string",
+  );
+  if (textOnly) {
+    return blocks.map((block) => block.text).join("\n");
+  }
+  return `${USER_CONTENT_BLOCKS_PREFIX}${JSON.stringify(blocks)}`;
+}
+
 /**
  * Convert AgentMessage[] to OpenAI message format for compression.
  */
@@ -79,12 +196,33 @@ export function agentToOpenAI(messages: any[]): OpenAIMessage[] {
     }
 
     if (role === "user") {
+      const content = normalized.content;
+      if (typeof content === "string") {
+        result.push({
+          role: "user",
+          content,
+          _headroomMeta: buildMeta(),
+        });
+        continue;
+      }
+
+      if (Array.isArray(content)) {
+        const userBlocks = normalizeUserContent(content);
+        const meta = {
+          ...buildMeta(),
+          userContentBlocks: userBlocks,
+        };
+        result.push({
+          role: "user",
+          content: serializeUserContentBlocks(userBlocks),
+          _headroomMeta: meta,
+        });
+        continue;
+      }
+
       result.push({
         role: "user",
-        content:
-          typeof normalized.content === "string"
-            ? normalized.content
-            : extractText(normalized.content),
+        content: JSON.stringify(content),
         _headroomMeta: buildMeta(),
       });
       continue;
@@ -100,14 +238,18 @@ export function agentToOpenAI(messages: any[]): OpenAIMessage[] {
       // Content blocks: extract text and tool call blocks.
       // OpenClaw uses `toolCall`; some adapters still emit legacy `tool_use`.
       if (Array.isArray(content)) {
+        const normalizedBlocks = normalizeAssistantContent(content);
         const textParts: string[] = [];
         const toolCalls: any[] = [];
+        const preservedBlocks: any[] = [];
 
-        for (const block of content) {
+        for (const block of normalizedBlocks) {
           if (typeof block === "string") {
             textParts.push(block);
-          } else if (block.type === "text") {
+            preservedBlocks.push({ type: "text", text: block });
+          } else if (block.type === "text" && typeof block.text === "string") {
             textParts.push(block.text);
+            preservedBlocks.push(block);
           } else if (block.type === "tool_use" || block.type === "toolCall") {
             const args =
               block.type === "toolCall"
@@ -124,13 +266,19 @@ export function agentToOpenAI(messages: any[]): OpenAIMessage[] {
                     : JSON.stringify(args ?? {}),
               },
             });
+            preservedBlocks.push(block);
+          } else {
+            preservedBlocks.push(block);
           }
         }
 
         const openaiMsg: OpenAIMessage = {
           role: "assistant",
           content: textParts.length > 0 ? textParts.join("") : null,
-          _headroomMeta: buildMeta(),
+          _headroomMeta: {
+            ...buildMeta(),
+            assistantContentBlocks: preservedBlocks,
+          },
         };
         if (toolCalls.length > 0) {
           openaiMsg.tool_calls = toolCalls;
@@ -141,22 +289,30 @@ export function agentToOpenAI(messages: any[]): OpenAIMessage[] {
     }
 
     if (role === "toolResult" || role === "tool_result") {
-      const content =
+      const toolBlocks =
         typeof normalized.content === "string"
-          ? normalized.content
+          ? [{ type: "text", text: normalized.content }]
           : Array.isArray(normalized.content)
-            ? extractText(normalized.content)
-            : JSON.stringify(normalized.content);
+            ? normalizeToolResultContent(normalized.content)
+            : [{ type: "text", text: JSON.stringify(normalized.content) }];
+      const toolName =
+        typeof normalized.toolName === "string" ? normalized.toolName : undefined;
+      const meta = {
+        ...buildMeta(),
+        toolContentBlocks: toolBlocks,
+        ...(toolName ? { toolName } : {}),
+      };
 
       result.push({
         role: "tool",
-        content,
+        content: serializeToolResultBlocks(toolBlocks),
         tool_call_id:
           normalized.toolCallId ??
           normalized.tool_use_id ??
           normalized.id ??
           "unknown",
-        _headroomMeta: buildMeta(),
+        ...(toolName ? { name: toolName } : {}),
+        _headroomMeta: meta,
       });
       continue;
     }
@@ -196,34 +352,52 @@ export function openAIToAgent(messages: OpenAIMessage[]): any[] {
     }
 
     if (msg.role === "user") {
+      const blocks = deserializeUserContent(msg.content, meta);
+      const content =
+        blocks.length === 1 && blocks[0]?.type === "text" && typeof blocks[0].text === "string"
+          ? blocks[0].text
+          : blocks;
       result.push({
+        ...(meta as object),
         role: "user",
-        content: msg.content ?? "",
+        content,
         timestamp,
       });
       continue;
     }
 
     if (msg.role === "assistant") {
-      const blocks: any[] = [];
-      if (msg.content) {
-        blocks.push({ type: "text", text: msg.content });
-      }
-      if (msg.tool_calls) {
-        for (const tc of msg.tool_calls) {
-          let input: any;
-          try {
-            input = JSON.parse(tc.function.arguments);
-          } catch {
-            input = tc.function.arguments ?? {};
+      const preserved = Array.isArray(meta.assistantContentBlocks)
+        ? (meta.assistantContentBlocks as any[])
+        : null;
+      const blocks: any[] = preserved ? [...preserved] : [];
+
+      if (!preserved) {
+        if (msg.content) {
+          blocks.push({ type: "text", text: msg.content });
+        }
+        if (msg.tool_calls) {
+          for (const tc of msg.tool_calls) {
+            let input: any;
+            try {
+              input = JSON.parse(tc.function.arguments);
+            } catch {
+              input = tc.function.arguments ?? {};
+            }
+            blocks.push({
+              type: "toolCall",
+              id: tc.id,
+              name: tc.function.name,
+              arguments: input,
+            });
           }
-          // Emit OpenClaw-native block shape so downstream transports keep call linkage.
-          blocks.push({
-            type: "toolCall",
-            id: tc.id,
-            name: tc.function.name,
-            arguments: input,
-          });
+        }
+      } else if (msg.content) {
+        const textIndex = blocks.findIndex((block) => block?.type === "text");
+        if (textIndex >= 0) {
+          blocks[textIndex] = { type: "text", text: msg.content };
+        } else {
+          blocks.unshift({ type: "text", text: msg.content });
         }
       }
       // OpenClaw's Pi agent expects content to always be an array for assistant messages
@@ -254,25 +428,30 @@ export function openAIToAgent(messages: OpenAIMessage[]): any[] {
     }
 
     if (msg.role === "tool") {
-      const textContent =
+      const rawContent =
         typeof msg.content === "string"
           ? msg.content
           : msg.content == null
             ? ""
             : JSON.stringify(msg.content);
       const toolCallId = msg.tool_call_id ?? "unknown";
+      const toolName =
+        typeof msg.name === "string"
+          ? msg.name
+          : typeof meta.toolName === "string"
+            ? meta.toolName
+            : "headroom";
+      const content = deserializeToolResultContent(rawContent, meta);
       result.push({
         ...(meta as object),
         role: "toolResult",
-        // OpenClaw transport layers expect toolResult content blocks, not a raw string.
-        content: [{ type: "text", text: textContent }],
+        content,
         toolCallId:
           typeof meta.toolCallId === "string" ? meta.toolCallId : toolCallId,
         tool_use_id:
           typeof meta.tool_use_id === "string" ? meta.tool_use_id : toolCallId,
-        toolName:
-          typeof meta.toolName === "string" ? meta.toolName : "headroom",
-        isError: typeof meta.isError === "boolean" ? meta.isError : false,
+        toolName,
+        isError: inferToolResultIsError(content, meta),
         timestamp,
       });
       continue;
@@ -393,7 +572,42 @@ function normalizeAssistantContent(content: unknown): any[] {
           },
         ];
       }
-      return [];
+      return [block];
+    });
+  }
+
+  if (typeof content === "string" && content.length > 0) {
+    return [{ type: "text", text: content }];
+  }
+
+  if (content == null) {
+    return [];
+  }
+
+  return [{ type: "text", text: JSON.stringify(content) }];
+}
+
+function normalizeUserContent(content: unknown): any[] {
+  if (Array.isArray(content)) {
+    return content.flatMap((block) => {
+      if (typeof block === "string") return [{ type: "text", text: block }];
+      if (!isRecord(block) || typeof block.type !== "string") return [];
+      if (block.type === "text" && typeof block.text === "string") return [block];
+      if (block.type === "tool_result" && "content" in block) {
+        return [
+          {
+            type: "tool_result",
+            tool_use_id:
+              typeof block.tool_use_id === "string"
+                ? block.tool_use_id
+                : typeof block.id === "string"
+                  ? block.id
+                  : "unknown",
+            content: normalizeToolResultContent(block.content),
+          },
+        ];
+      }
+      return [block];
     });
   }
 
@@ -424,7 +638,7 @@ function normalizeToolResultContent(content: unknown): any[] {
       if (block.type === "tool_result" && "content" in block) {
         return normalizeToolResultContent(block.content);
       }
-      return [];
+      return [block];
     });
   }
 
@@ -437,6 +651,27 @@ function normalizeToolResultContent(content: unknown): any[] {
   }
 
   return [{ type: "text", text: JSON.stringify(content) }];
+}
+
+function inferToolResultIsError(
+  blocks: unknown[],
+  meta: Record<string, unknown>,
+): boolean {
+  if (typeof meta.isError === "boolean") return meta.isError;
+  for (const block of blocks) {
+    if (!isRecord(block) || block.type !== "text" || typeof block.text !== "string") {
+      continue;
+    }
+    const trimmed = block.text.trim();
+    if (!trimmed.startsWith("{")) continue;
+    try {
+      const parsed = JSON.parse(trimmed) as { status?: string };
+      if (parsed.status === "error") return true;
+    } catch {
+      // not JSON — ignore
+    }
+  }
+  return false;
 }
 
 function isRecord(value: unknown): value is Record<string, any> {

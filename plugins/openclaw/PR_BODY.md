@@ -14,7 +14,7 @@ This PR addresses five related issues in the headroom OpenClaw plugin:
 
 5. **`assemble()` always hit the proxy**, even when context was already under budget (e.g. 100–200k tokens on a 1M-window model). Every turn paid multi-minute Kompress/tokenizer cost; in `HEADROOM_MODE=cache` many runs saved 0 tokens anyway (`router:noop`, prefix frozen).
 
-Closes # (no upstream issue opened; surfaced from internal production use with minimax-portal/MiniMax-M3 against Minimax's anthropic-compat endpoint at api.minimax.io, OpenRouter, and opencode-go).
+Closes # (no upstream issue opened; surfaced from production use with multi-provider OpenClaw deployments routing Anthropic-shape, OpenRouter, and OpenCode-compatible APIs through one Headroom proxy).
 
 ## Response to review (@JerrettDavis, commits `3209280` + `9b0f778`)
 
@@ -76,6 +76,8 @@ Thanks for the detailed review on `656ea3f`. Both blockers are addressed in the 
 - **Commit 9–10** `Durable commitTurn advancement and Gemini /v1beta routing` (review feedback)
   - **P1:** Replaces the no-op `commitTurn()` with a durable, idempotent store keyed by `advancementKey`, using the OpenClaw contract field `messages` (not `acceptedTurn`). Persists the full accepted `messages` payload to disk, returns `{ status: "duplicate" }` on retry, and includes restart/retry/failed-write tests.
   - **P2:** Adds protocol-aware proxy pathname normalization via `resolveProxyPathPrefix()` — Gemini/Google providers keep `/v1beta` so requests reach `handle_gemini_generate_content`; OpenAI-compatible providers stay on `/v1`. Includes routing regression tests that assert generateContent URLs match the Gemini handler path.
+- **Later commits** `Tool-call preservation, hybrid compaction, assemble tuning`
+  - Preserve image/structured tool results through `convert.ts`; set OpenAI `tool.name`; gate CCR hints; `assembleCompressConfig` / `skipAssembleWhenGatewayRouted`; safer durable hygiene defaults. See `docs/tool-call-preservation.md` and `docs/PR_OVERVIEW.md`.
 
 ## Testing
 
@@ -94,53 +96,42 @@ Thanks for the detailed review on `656ea3f`. Both blockers are addressed in the 
 
 ```
 $ npm test
-
- Test Files  8 passed (8)
-      Tests  97 passed (97)
-   Duration  ~1.2s
+ Test Files  16 passed (16)
+      Tests  220+ passed
+$ npm run typecheck   # clean
+$ npm run build       # dist ~76 KB
+$ npm run test:stress # native-tool mock stress
 ```
 
-```
-$ npm run typecheck
-> headroom-openclaw@0.37.0 typecheck
-> node node_modules/@typescript/native/bin/tsc --noEmit
-(no errors)
-```
-
-```
-$ npm run build
-ESM dist/index.js     ~56 KB
-ESM ⚡️ Build success
-DTS dist/index.d.ts   ~13 KB
-```
+See `docs/TEST_MATRIX.md` and `test/README.md` for the full PR coverage map.
 
 ## Real Behavior Proof
 
 ### Environment.
 
-- OpenClaw `2026.9.2` (gateway from /home/linuxbrew/.linuxbrew/lib/node_modules/openclaw)
-- headroom plugin fork `~/work/headroom/plugins/openclaw` (this PR)
-- headroom proxy `0.37.0` stock at `127.0.0.1:8787`
-- systemd user service `~/.config/systemd/user/headroom-proxy.service` with `ANTHROPIC_TARGET_API_URL=https://api.minimax.io/anthropic` and `HEADROOM_UPSTREAM_ALLOWED_HOSTS=api.minimax.io,openrouter.ai,opencode.ai`
-- providers: `minimax-portal` (Anthropic-shape via Minimax's anthropic-compat endpoint), `openrouter` (paid key, tested via the `openrouter/free` auto-router which selects a free model at request time), `opencode-go` (OpenCode Go Zen)
+- OpenClaw 2026.9.x gateway with Headroom context engine slot
+- This plugin built from `plugins/openclaw` on branch `pr-prep`
+- Headroom proxy 0.37.x on `127.0.0.1:8787`
+- Multi-provider config: Anthropic-shape portal API, OpenRouter, OpenCode-compatible upstream
+- Proxy env: `HEADROOM_UPSTREAM_ALLOWED_HOSTS` whitelists upstream hosts for `x-headroom-base-url`
 
 ### Exact command / steps.
 
-1. Apply all 8 commits to a clean checkout of `plugins/openclaw` on top of `headroomlabs-ai/headroom:main`
-2. `npm install && npm run build`
-3. Install via `openclaw plugins install --link dist --force --accept-capabilities --acknowledge-install-policy-warning`
-4. Set the plugin config in `~/.openclaw/openclaw.json` (see "Configuration" section below)
-5. Restart OpenClaw gateway: `systemctl --user restart openclaw-gateway.service`
+1. Check out this branch on top of current `headroomlabs-ai/headroom:main`
+2. `cd plugins/openclaw && npm install && npm test && npm run build`
+3. Install plugin via `openclaw plugins install --link dist` (or equivalent)
+4. Configure `gatewayProviderIds`, `providerUpstreams`, optional `providerSessionHeaders` (see below)
+5. Restart OpenClaw gateway and Headroom proxy
 
 ### Observed result.
 
-- Minimax-Anthropic (`minimax-portal/MiniMax-M3`): 67 requests routed through proxy → `api.minimax.io/anthropic/v1/messages`, all 200 OK, `assemble()` fired, `transforms=content_router:code_aware:mixed:log:text:tabular:config:html`
-- OpenRouter (`openrouter/free` → `nvidia/nemotron-3-ultra-550b-a55b:free`): 25 requests routed through proxy with `x-headroom-base-url: https://openrouter.ai/api`, all 200 OK
-- opencode-go (`opencode-go/mimo-v2.5`): requests routed through proxy with `x-headroom-base-url: https://opencode.ai/zen/go` and `x-opencode-session: <uuid>`, all 200 OK, returns coherent reply in ~7s
-- Per-turn compression measured: `tok_before=233435 tok_after=211938 tok_saved=21497` (9.2% on a single turn), `tok_before=432427 tok_after=382342` (11.6% on a heavier turn)
-- Overall: 432 requests through proxy, 5.58M tokens removed, 7.66% overall savings
-- Durable compaction: `openclaw sessions compact --max-lines 500` on an 888k-token fork session → ~97k tokens; `/compact` via Headroom proxy rewrites SQLite transcript instead of instant no-op
-- Assemble short-circuit: after trim, godot fork session (~97–170k tokens on 1M model) responds in ~17–58s with Headroom CPU near idle (assemble skip); before fix, every turn pegged proxy at 300%+ CPU for minutes
+- Anthropic-shape provider: requests routed through proxy to configured upstream; `assemble()` fires; content_router transforms applied
+- OpenRouter: requests include `x-headroom-base-url` header; 200 OK through proxy
+- OpenCode-compatible provider: `x-headroom-base-url` + session header injected; 200 OK
+- Per-turn compression: measurable token savings on large tool-heavy turns (single-digit to low-double-digit percent typical)
+- Durable compaction: `/compact` rewrites SQLite transcript via Headroom `/v1/compress` instead of instant no-op
+- Assemble short-circuit: sub-budget contexts skip proxy compression (CPU idle vs multi-minute compress on 100–200k windows)
+- Tool-call preservation: `view_image` image blocks survive compress round-trip; native-tool stress suite passes (mock + live proxy)
 
 ### Not tested.
 
@@ -191,16 +182,11 @@ The patches are opt-in by default. Operators who want to route multiple OpenAI-c
 ```
 
 ```bash
-# Restart the proxy with the matching upstream env vars
-cat > ~/.config/systemd/user/headroom-proxy.service << 'EOF'
-[Service]
-Environment=ANTHROPIC_TARGET_API_URL=https://api.minimax.io/anthropic
-Environment=OPENAI_TARGET_API_URL=https://openrouter.ai/api
-Environment=HEADROOM_UPSTREAM_ALLOWED_HOSTS=api.minimax.io,openrouter.ai,opencode.ai
-ExecStart=/home/<user>/.local/bin/headroom proxy --host 127.0.0.1 --port 8787
-EOF
-systemctl --user daemon-reload
-systemctl --user restart headroom-proxy.service
+# Example proxy env (systemd, shell, or process manager)
+export ANTHROPIC_TARGET_API_URL=https://api.example.com/anthropic
+export OPENAI_TARGET_API_URL=https://openrouter.ai/api
+export HEADROOM_UPSTREAM_ALLOWED_HOSTS=api.example.com,openrouter.ai,opencode.ai
+headroom proxy --host 127.0.0.1 --port 8787
 ```
 
 The `providerUpstreams` URLs must NOT include a trailing `/v1`; the proxy appends the request path itself. The `HEADROOM_UPSTREAM_ALLOWED_HOSTS` env var on the proxy is a security gate — without it the `x-headroom-base-url` header is ignored.
@@ -240,8 +226,8 @@ Production deployments that want hybrid should set `"persistentCompaction": "hyb
 - [x] I have commented my code, particularly in hard-to-understand areas
 - [x] I have made corresponding changes to the documentation (PR description includes "Configuration for operators" section + each commit message documents the rationale inline)
 - [x] My changes generate no new warnings (`npm run typecheck` clean, `npm run build` clean)
-- [x] I have added tests that prove my fix is effective or that my feature works (commits 5–8 add compaction + assemble short-circuit tests; 89 total)
-- [x] New and existing unit tests pass locally with my changes (`npm test`: 89/89 passing)
+- [x] I have added tests that prove my fix is effective or that my feature works (see `docs/TEST_MATRIX.md`; 220+ vitest cases + optional live proxy stress)
+- [x] New and existing unit tests pass locally with my changes (`npm test` green)
 - [x] I did **not** edit `CHANGELOG.md` — it is generated by release-please from my Conventional Commit PR title (a CI guard enforces this)
 
 ## Additional Notes
