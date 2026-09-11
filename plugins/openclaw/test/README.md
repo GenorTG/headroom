@@ -23,6 +23,8 @@
 | `compaction*.test.ts` | Durable SQLite compaction modes |
 | `gateway-config.test.ts` | Multi-upstream routing |
 | `turn-advancement-store.test.ts` | Durable `commitTurn` persistence |
+| `store-lock.test.ts` | Lock protocol: atomic publish, staleness rules, two-process acquire boundary |
+| `truncate-boundary.test.ts` | Turn-start selection and orphan `toolResult` removal |
 | `tool-call-preservation.integration.test.ts` | Mock proxy + assemble round-trip |
 | `stress/openclaw-tools.stress.test.ts` | All native tools under aggressive crush |
 | `fixtures/openclaw-native-tools.ts` | Shared transcript builders |

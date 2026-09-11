@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { tmpdir } from "node:os";
 
 const fetchMock = vi.hoisted(() => vi.fn());
 const sessionManagerMock = vi.hoisted(() => ({
@@ -141,7 +142,7 @@ describe("planHeadroomCompaction", () => {
     });
   });
 
-  it("forced truncate drops prefix messages including protected tool payloads (known limitation)", async () => {
+  it("forced truncate drops prefix messages, including protected tool payloads that fall before the cut", async () => {
     const imageMessage = {
       role: "toolResult",
       toolCallId: "call_img",
@@ -458,7 +459,7 @@ describe("applyCompactionPlan truncate", () => {
     const result = await applyCompactionPlan({
       sessionTarget: { sessionId: "session-1" },
       plan,
-      cwd: "/tmp",
+      cwd: tmpdir(),
     });
 
     const afterBranch = sessionManager.getBranch();
@@ -479,7 +480,8 @@ describe("applyCompactionPlan truncate", () => {
       tokens_saved: 0,
     });
 
-    const branchMessages = Array.from({ length: 20 }, (_, index) => ({
+    // Above the 40-message keep floor so forced trimming actually drops a prefix.
+    const branchMessages = Array.from({ length: 100 }, (_, index) => ({
       entryId: `entry-${index}`,
       parentId: index === 0 ? null : `entry-${index - 1}`,
       message: { role: "user", content: `msg-${index}`, timestamp: index },
@@ -492,6 +494,7 @@ describe("applyCompactionPlan truncate", () => {
       timeoutMs: 30_000,
       force: true,
     });
+    expect(plan.mode).toBe("truncate");
 
     const sessionManager = createBranchingSessionManager(branchMessages);
     const resetLeaf = vi.spyOn(sessionManager, "resetLeaf");
@@ -501,7 +504,7 @@ describe("applyCompactionPlan truncate", () => {
     await applyCompactionPlan({
       sessionTarget: { sessionId: "session-1" },
       plan,
-      cwd: "/tmp",
+      cwd: tmpdir(),
     });
 
     expect(resetLeaf).toHaveBeenCalledTimes(1);
@@ -542,7 +545,7 @@ describe("applyCompactionPlan truncate", () => {
     const result = await applyCompactionPlan({
       sessionTarget: { sessionId: "session-1" },
       plan,
-      cwd: "/tmp",
+      cwd: tmpdir(),
     });
 
     expect(sessionManager.getBranch().length).toBe(20);
@@ -568,7 +571,7 @@ describe("applyCompactionPlan truncate", () => {
         tokensAfter: 50,
         appendMessages: [],
       },
-      cwd: "/tmp",
+      cwd: tmpdir(),
     });
 
     expect(result).toEqual({
@@ -609,7 +612,7 @@ describe("applyCompactionPlan truncate", () => {
     await applyCompactionPlan({
       sessionTarget: { sessionId: "session-1" },
       plan,
-      cwd: "/tmp",
+      cwd: tmpdir(),
     });
 
     expect(sessionManager.getBranch()[0]?.parentId).toBeNull();
@@ -653,5 +656,200 @@ describe("applyCompactionPlan truncate", () => {
       fixedManager.appendMessage(message);
     }
     expect(fixedManager.getBranch().length).toBe(plan.appendMessages?.length);
+  });
+});
+
+describe("truncate turn-boundary selection", () => {
+  const ASSISTANT_META = {
+    api: "anthropic-messages",
+    provider: "anthropic",
+    model: "claude-sonnet-4-5",
+    stopReason: "toolUse",
+  };
+
+  /**
+   * Reviewer fixture: an assistant toolCall + its toolResult followed by 39 user
+   * messages (41 total). A raw suffix of 40 would start at the orphan toolResult.
+   */
+  function reviewerFixture(): BranchMessageEntry[] {
+    const messages: unknown[] = [
+      {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "cut-call", name: "read", arguments: { path: "a" } }],
+        ...ASSISTANT_META,
+        timestamp: 0,
+      },
+      {
+        role: "toolResult",
+        toolCallId: "cut-call",
+        toolName: "read",
+        content: [{ type: "text", text: "file body" }],
+        isError: false,
+        timestamp: 1,
+      },
+      ...Array.from({ length: 39 }, (_, index) => ({
+        role: "user",
+        content: `user-${index}`,
+        timestamp: index + 2,
+      })),
+    ];
+    return messages.map((message, index) => ({
+      entryId: `entry-${index}`,
+      parentId: index === 0 ? null : `entry-${index - 1}`,
+      message,
+    }));
+  }
+
+  function reload(entries: Array<{ message: unknown }>): Array<Record<string, unknown>> {
+    return entries.map((entry) => entry.message as Record<string, unknown>);
+  }
+
+  it("forced trimming never starts the kept tail at an orphan toolResult (41-message fixture)", async () => {
+    mockCompressResponse({
+      messages: [{ role: "user", content: "hello" }],
+      tokens_before: 900_000,
+      tokens_after: 900_000,
+      tokens_saved: 0,
+    });
+    const branchMessages = reviewerFixture();
+
+    const plan = await planHeadroomCompaction({
+      branchMessages,
+      tokenBudget: 120_000,
+      proxyUrl: "http://127.0.0.1:8787",
+      timeoutMs: 30_000,
+      force: true,
+    });
+
+    expect(plan.mode).toBe("truncate");
+    const kept = plan.appendMessages as Array<Record<string, unknown>>;
+    // The raw 40-suffix would begin at entry-1 (the toolResult); the aligned cut
+    // begins at the first user turn instead.
+    expect(kept).toHaveLength(39);
+    expect(kept[0]).toMatchObject({ role: "user", content: "user-0" });
+    expect(kept.some((m) => m.role === "toolResult")).toBe(false);
+    expect(plan.truncateParentId).toBe("entry-1");
+
+    const sessionManager = createBranchingSessionManager(branchMessages);
+    vi.mocked(SessionManager.open).mockReturnValue(sessionManager);
+    await applyCompactionPlan({ sessionTarget: { sessionId: "session-1" }, plan, cwd: tmpdir() });
+
+    const reloaded = reload(sessionManager.getBranch());
+    expect(reloaded).toHaveLength(39);
+    expect(reloaded[0]).toMatchObject({ role: "user", content: "user-0" });
+    expect(reloaded.at(-1)).toMatchObject({ role: "user", content: "user-38" });
+    expect(reloaded.every((m) => m.role === "user")).toBe(true);
+  });
+
+  it("keeps whole tool groups when the cut falls inside a multi-call turn", async () => {
+    mockCompressResponse({
+      messages: [{ role: "user", content: "hello" }],
+      tokens_before: 900_000,
+      tokens_after: 900_000,
+      tokens_saved: 0,
+    });
+    // 30 user turns, each: user -> assistant(2 toolCalls) -> toolResult -> toolResult (120 msgs).
+    const messages: unknown[] = [];
+    for (let turn = 0; turn < 30; turn += 1) {
+      messages.push({ role: "user", content: `ask-${turn}`, timestamp: turn * 4 });
+      messages.push({
+        role: "assistant",
+        content: [
+          { type: "toolCall", id: `c${turn}a`, name: "read", arguments: {} },
+          { type: "toolCall", id: `c${turn}b`, name: "exec", arguments: {} },
+        ],
+        ...ASSISTANT_META,
+        timestamp: turn * 4 + 1,
+      });
+      messages.push({ role: "toolResult", toolCallId: `c${turn}a`, toolName: "read", content: "r", isError: false, timestamp: turn * 4 + 2 });
+      messages.push({ role: "toolResult", toolCallId: `c${turn}b`, toolName: "exec", content: "e", isError: false, timestamp: turn * 4 + 3 });
+    }
+    const branchMessages = messages.map((message, index) => ({
+      entryId: `entry-${index}`,
+      parentId: index === 0 ? null : `entry-${index - 1}`,
+      message,
+    }));
+
+    const plan = await planHeadroomCompaction({
+      branchMessages,
+      tokenBudget: 120_000,
+      proxyUrl: "http://127.0.0.1:8787",
+      timeoutMs: 30_000,
+      force: true,
+    });
+
+    expect(plan.mode).toBe("truncate");
+    const kept = plan.appendMessages as Array<Record<string, unknown>>;
+    expect(kept[0]?.role).toBe("user");
+    expect(kept.length % 4).toBe(0);
+
+    const calls = new Set<string>();
+    for (const m of kept) {
+      if (m.role === "assistant") {
+        for (const b of m.content as Array<{ id: string }>) calls.add(b.id);
+      }
+      if (m.role === "toolResult") {
+        expect(calls.has(m.toolCallId as string)).toBe(true);
+      }
+    }
+  });
+
+  it("re-aligns a compress-result truncate whose proxy cut landed on a toolResult", async () => {
+    const branchMessages = reviewerFixture();
+    // Proxy dropped exactly the first message: its window starts at the toolResult.
+    mockCompressResponse({
+      messages: branchMessages.slice(1).map((entry) => {
+        const m = entry.message as Record<string, unknown>;
+        return m.role === "toolResult"
+          ? { role: "tool", tool_call_id: "cut-call", name: "read", content: "file body" }
+          : { role: "user", content: m.content };
+      }),
+      tokens_before: 900_000,
+      tokens_after: 300_000,
+      tokens_saved: 600_000,
+    });
+
+    const plan = await planHeadroomCompaction({
+      branchMessages,
+      tokenBudget: 120_000,
+      proxyUrl: "http://127.0.0.1:8787",
+      timeoutMs: 30_000,
+    });
+
+    expect(plan.mode).toBe("truncate");
+    const kept = plan.appendMessages as Array<Record<string, unknown>>;
+    expect(kept[0]).toMatchObject({ role: "user", content: "user-0" });
+    expect(kept.some((m) => m.role === "toolResult")).toBe(false);
+  });
+
+  it("refuses to truncate when the transcript has no turn boundary", async () => {
+    mockCompressResponse({
+      messages: [{ role: "user", content: "hello" }],
+      tokens_before: 900_000,
+      tokens_after: 900_000,
+      tokens_saved: 0,
+    });
+    const branchMessages = Array.from({ length: 60 }, (_, index) => ({
+      entryId: `entry-${index}`,
+      parentId: index === 0 ? null : `entry-${index - 1}`,
+      message:
+        index % 2 === 0
+          ? {
+              role: "assistant",
+              content: [{ type: "toolCall", id: `c${index}`, name: "read", arguments: {} }],
+              ...ASSISTANT_META,
+              timestamp: index,
+            }
+          : { role: "toolResult", toolCallId: `c${index - 1}`, toolName: "read", content: "r", isError: false, timestamp: index },
+    }));
+
+    const plan = await planHeadroomCompaction({
+      branchMessages,
+      tokenBudget: 120_000,
+      proxyUrl: "http://127.0.0.1:8787",
+      timeoutMs: 30_000,
+      force: true,
+    });
+    expect(plan.mode).toBe("none");
   });
 });

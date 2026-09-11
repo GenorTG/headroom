@@ -268,7 +268,7 @@ Design note: an earlier iteration of this branch carried block arrays inside a `
 
 - [x] `planHeadroomCompaction` does not replace entries whose payload contains image blocks
 - [x] Durable compress requests `protect_recent: 2`
-- [x] Forced truncate plan documents dropped tool pairs (known limitation — prefix drop, test locked)
+- [x] Forced / compress-result truncate re-aligns the cut to a turn start and drops orphan tool results (`truncate-boundary.ts`); prefix tool pairs before the cut are dropped whole
 
 ### Manual / integration (staging)
 

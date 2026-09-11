@@ -7,6 +7,7 @@
 import { resolveDurableCompressConfig } from "./compress-request-config.js";
 import { messageHasProtectedToolPayload } from "./content-blocks.js";
 import { agentToOpenAI, openAIToAgent } from "./convert.js";
+import { dropOrphanToolResults, selectTruncateStart } from "./truncate-boundary.js";
 
 type SessionManagerLike = {
   getBranch(): unknown[];
@@ -283,9 +284,22 @@ function buildCompactionPlanFromCompressResult(options: {
   }
 
   if (compressedAgent.length < originals.length) {
+    // The proxy's rolling window drops a prefix. Re-align the cut to a turn
+    // boundary so the durable tail never starts mid-turn or at an orphan
+    // toolResult; messages between the aligned start and the proxy's cut are
+    // kept verbatim from the originals.
     const dropped = originals.length - compressedAgent.length;
-    const firstKept = branchMessages[dropped];
-    if (!firstKept) {
+    const selection = selectTruncateStart(originals, dropped);
+    if (!selection || selection.startIndex === 0) {
+      return { mode: "none", tokensBefore, tokensAfter: tokensBefore };
+    }
+    const { startIndex } = selection;
+    const tail =
+      startIndex >= dropped
+        ? compressedAgent.slice(startIndex - dropped)
+        : [...originals.slice(startIndex, dropped), ...compressedAgent];
+    const appendMessages = dropOrphanToolResults(tail);
+    if (appendMessages.length === 0) {
       return { mode: "none", tokensBefore, tokensAfter: tokensBefore };
     }
 
@@ -293,8 +307,8 @@ function buildCompactionPlanFromCompressResult(options: {
       mode: "truncate",
       tokensBefore,
       tokensAfter,
-      truncateParentId: firstKept.parentId,
-      appendMessages: compressedAgent,
+      truncateParentId: branchMessages[startIndex]!.parentId,
+      appendMessages,
     };
   }
 
@@ -316,15 +330,24 @@ function buildForcedTruncatePlan(options: {
       ? Math.min(0.85, tokenBudget / Math.max(tokensBefore, 1))
       : 0.35;
   const keepCount = Math.max(40, Math.min(branchMessages.length, Math.ceil(branchMessages.length * ratio)));
-  const dropped = branchMessages.length - keepCount;
-  const kept = branchMessages.slice(dropped);
-  const firstKept = kept[0];
-  if (!firstKept) {
+  const desiredStart = branchMessages.length - keepCount;
+
+  // Never cut mid-turn: move the cut to the nearest turn start (OpenClaw's own
+  // compaction rule) so the tail never begins with an orphan toolResult or an
+  // assistant continuation, and always retains the latest user turn.
+  const messages = branchMessages.map((entry) => entry.message);
+  const selection = selectTruncateStart(messages, desiredStart);
+  if (!selection || selection.startIndex === 0) {
+    return { mode: "none", tokensBefore, tokensAfter: tokensBefore };
+  }
+  const { startIndex } = selection;
+  const appendMessages = dropOrphanToolResults(messages.slice(startIndex));
+  if (appendMessages.length === 0) {
     return { mode: "none", tokensBefore, tokensAfter: tokensBefore };
   }
 
   const estimatedAfter = Math.max(
-    Math.floor(tokensBefore * (keepCount / branchMessages.length)),
+    Math.floor(tokensBefore * (appendMessages.length / branchMessages.length)),
     Math.floor(tokensBefore * 0.15),
   );
 
@@ -332,8 +355,8 @@ function buildForcedTruncatePlan(options: {
     mode: "truncate",
     tokensBefore,
     tokensAfter: estimatedAfter,
-    truncateParentId: firstKept.parentId,
-    appendMessages: kept.map((entry) => entry.message),
+    truncateParentId: branchMessages[startIndex]!.parentId,
+    appendMessages,
   };
 }
 

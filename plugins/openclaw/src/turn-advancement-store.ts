@@ -6,17 +6,10 @@
  */
 
 import { createHash } from "node:crypto";
-import {
-  closeSync,
-  mkdirSync,
-  openSync,
-  readFileSync,
-  renameSync,
-  unlinkSync,
-  writeFileSync,
-  writeSync,
-} from "node:fs";
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { type StoreLockOptions, withStoreLock } from "./store-lock.js";
 
 export interface TurnAdvancementRecord {
   advancementKey: string;
@@ -30,15 +23,14 @@ export interface TurnAdvancementStoreOptions {
   storePath: string;
   /** Test hook invoked immediately before the atomic persist. */
   injectBeforePersist?: () => void;
+  /** Lock tuning (timeouts / stale thresholds); defaults suit production. */
+  lockOptions?: StoreLockOptions;
 }
 
 interface PersistedTurnAdvancements {
   version: 1;
   records: Record<string, TurnAdvancementRecord>;
 }
-
-const LOCK_RETRY_MS = 10;
-const LOCK_MAX_ATTEMPTS = 200;
 
 export function digestTurnMessages(messages: unknown[]): string {
   return createHash("sha256").update(JSON.stringify(messages)).digest("hex");
@@ -57,73 +49,15 @@ export function resolveTurnAdvancementStorePath(params: {
     return join(dirname(sessionStorePath), "headroom-turn-advancements.json");
   }
 
-  const stateDir =
-    process.env.OPENCLAW_STATE_DIR ??
-    join(process.env.HOME ?? "/tmp", ".openclaw");
-  return join(stateDir, "headroom-turn-advancements.json");
-}
-
-function sleepSync(ms: number): void {
-  const deadline = Date.now() + ms;
-  while (Date.now() < deadline) {
-    // Busy wait keeps commit() synchronous for callers.
-  }
-}
-
-function isStaleLockPid(pidText: string): boolean {
-  const pid = Number.parseInt(pidText.trim(), 10);
-  if (!Number.isFinite(pid) || pid <= 0) {
-    return true;
-  }
-  try {
-    process.kill(pid, 0);
-    return false;
-  } catch {
-    return true;
-  }
-}
-
-function withStoreLock<T>(lockPath: string, fn: () => T): T {
-  mkdirSync(dirname(lockPath), { recursive: true });
-
-  let lockFd: number | undefined;
-  for (let attempt = 0; attempt < LOCK_MAX_ATTEMPTS; attempt += 1) {
+  const homeDir = (() => {
     try {
-      lockFd = openSync(lockPath, "wx");
-      writeSync(lockFd, `${process.pid}\n`);
-      break;
-    } catch (error) {
-      const err = error as NodeJS.ErrnoException;
-      if (err.code !== "EEXIST") {
-        throw error;
-      }
-      try {
-        const owner = readFileSync(lockPath, "utf8");
-        if (isStaleLockPid(owner)) {
-          unlinkSync(lockPath);
-          continue;
-        }
-      } catch {
-        // Another process may have released the lock between attempts.
-      }
-      sleepSync(LOCK_RETRY_MS);
-    }
-  }
-
-  if (lockFd === undefined) {
-    throw new Error(`timed out acquiring turn advancement lock at ${lockPath}`);
-  }
-
-  try {
-    return fn();
-  } finally {
-    closeSync(lockFd);
-    try {
-      unlinkSync(lockPath);
+      return homedir();
     } catch {
-      // Best effort — the next acquirer treats stale locks via pid checks.
+      return tmpdir();
     }
-  }
+  })();
+  const stateDir = process.env.OPENCLAW_STATE_DIR ?? join(homeDir, ".openclaw");
+  return join(stateDir, "headroom-turn-advancements.json");
 }
 
 function loadPersistedRecords(storePath: string): Map<string, TurnAdvancementRecord> {
@@ -197,19 +131,13 @@ export class TurnAdvancementStore {
 
       const nextRecords = new Map(records);
       nextRecords.set(params.advancementKey, record);
-      try {
-        persistRecords(
-          this.options.storePath,
-          nextRecords,
-          this.options.injectBeforePersist,
-        );
-      } catch (error) {
-        throw error;
-      }
+      // If persist throws, the key is not cached as committed and a retry
+      // returns "committed" (not "duplicate") after re-reading disk under lock.
+      persistRecords(this.options.storePath, nextRecords, this.options.injectBeforePersist);
 
       this.syncMemoryFromDisk(nextRecords);
       return "committed";
-    });
+    }, this.options.lockOptions);
   }
 
   has(advancementKey: string): boolean {
