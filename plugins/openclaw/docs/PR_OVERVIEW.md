@@ -36,7 +36,7 @@ paths or credentials.
 | `src/compaction.ts` | Durable `/v1/compress` planning + SQLite apply; protected-payload skip on replace |
 | `src/compaction-mode.ts` | `persistentCompaction`: `openclaw` (default), `hybrid`, `headroom` |
 | `src/compress-request-config.ts` | Shared assemble + durable compress config defaults (`protect_recent: 2`) |
-| `src/turn-advancement-store.ts` | Idempotent on-disk turn advancement keyed by `advancementKey` |
+| `src/turn-advancement-store.ts` | Idempotent on-disk turn advancement keyed by `advancementKey`; digest-only records (no message bodies), 14-day / 5 000-record retention |
 | `src/store-lock.ts` | Cross-process lock: atomic ownership publish, age + liveness staleness, rename-claimed recovery |
 | `src/truncate-boundary.ts` | Turn-boundary selection + orphan `toolResult` removal for durable truncation |
 | `src/gateway-config.ts` | In-memory provider rewrite; `providerUpstreams`; `providerSessionHeaders` |
@@ -68,7 +68,7 @@ paths or credentials.
 
 ### Tests
 
-See [TEST_MATRIX.md](./TEST_MATRIX.md). Summary: **292 vitest cases** across 21 files, plus optional live proxy stress scripts.
+See [TEST_MATRIX.md](./TEST_MATRIX.md). Summary: **295 vitest cases** across 21 files, plus optional live proxy stress scripts.
 
 ## Merge with upstream `main` (2026-09-11) — done
 
