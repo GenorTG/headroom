@@ -114,6 +114,129 @@ describe("planHeadroomCompaction", () => {
     expect(plan.mode).toBe("none");
   });
 
+  it("requests safer durable hygiene defaults from the proxy", async () => {
+    mockCompressResponse({
+      messages: [{ role: "user", content: "hello" }],
+      tokens_before: 1000,
+      tokens_after: 1000,
+      tokens_saved: 0,
+    });
+
+    await planHeadroomCompaction({
+      branchMessages: [
+        {
+          entryId: "entry-0",
+          parentId: null,
+          message: { role: "user", content: "hello", timestamp: 0 },
+        },
+      ],
+      tokenBudget: 120_000,
+      proxyUrl: "http://127.0.0.1:8787",
+      timeoutMs: 30_000,
+    });
+
+    const requestBody = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body));
+    expect(requestBody.config).toMatchObject({
+      protect_recent: 2,
+    });
+  });
+
+  it("forced truncate drops prefix messages including protected tool payloads (known limitation)", async () => {
+    const imageMessage = {
+      role: "toolResult",
+      toolCallId: "call_img",
+      toolName: "view_image",
+      content: [{ type: "image", data: "abc123", mimeType: "image/png" }],
+      timestamp: 1,
+    };
+    const branchMessages = [
+      {
+        entryId: "entry-0",
+        parentId: null,
+        message: imageMessage,
+      },
+      ...Array.from({ length: 99 }, (_, index) => ({
+        entryId: `entry-${index + 1}`,
+        parentId: index === 0 ? "entry-0" : `entry-${index}`,
+        message: { role: "user", content: `msg-${index}`, timestamp: index + 2 },
+      })),
+    ];
+
+    mockCompressResponse({
+      messages: branchMessages.map((entry) => ({
+        role: "user",
+        content:
+          typeof entry.message.content === "string"
+            ? entry.message.content
+            : JSON.stringify(entry.message.content),
+      })),
+      tokens_before: 900_000,
+      tokens_after: 900_000,
+      tokens_saved: 0,
+    });
+
+    const plan = await planHeadroomCompaction({
+      branchMessages,
+      tokenBudget: 120_000,
+      proxyUrl: "http://127.0.0.1:8787",
+      timeoutMs: 30_000,
+      force: true,
+    });
+
+    expect(plan.mode).toBe("truncate");
+    expect(plan.appendMessages?.some((message) => message.role === "toolResult")).toBe(false);
+    expect(plan.truncateParentId).not.toBeNull();
+  });
+
+  it("skips replace compaction for image tool results", async () => {
+    const imageMessage = {
+      role: "toolResult",
+      toolCallId: "call_img",
+      toolName: "view_image",
+      content: [{ type: "image", data: "abc123", mimeType: "image/png" }],
+      timestamp: 2,
+    };
+    const branchMessages = [
+      {
+        entryId: "entry-0",
+        parentId: null,
+        message: { role: "user", content: "show screenshot", timestamp: 1 },
+      },
+      {
+        entryId: "entry-1",
+        parentId: "entry-0",
+        message: imageMessage,
+      },
+    ];
+
+    mockCompressResponse({
+      messages: [
+        { role: "user", content: "[compressed user turn]" },
+        {
+          role: "tool",
+          content: "[compressed image summary]",
+          tool_call_id: "call_img",
+          name: "view_image",
+        },
+      ],
+      tokens_before: 5000,
+      tokens_after: 1200,
+      tokens_saved: 3800,
+    });
+
+    const plan = await planHeadroomCompaction({
+      branchMessages,
+      tokenBudget: 120_000,
+      proxyUrl: "http://127.0.0.1:8787",
+      timeoutMs: 30_000,
+      force: true,
+    });
+
+    expect(plan.mode).toBe("replace");
+    expect(plan.replacements?.map((entry) => entry.entryId)).toEqual(["entry-0"]);
+    expect(plan.replacements?.[0]?.message.content).toBe("[compressed user turn]");
+  });
+
   it("plans truncate when compress returns fewer messages than the branch", async () => {
     const branchMessages = Array.from({ length: 50 }, (_, index) => ({
       entryId: `entry-${index}`,

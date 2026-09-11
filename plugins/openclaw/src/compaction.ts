@@ -4,7 +4,8 @@
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
-import { agentToOpenAI, openAIToAgent } from "./convert.js";
+import { resolveDurableCompressConfig } from "./compress-request-config.js";
+import { agentToOpenAI, messageHasProtectedToolPayload, openAIToAgent } from "./convert.js";
 
 type SessionManagerLike = {
   getBranch(): unknown[];
@@ -204,12 +205,7 @@ async function compressDurableTranscript(
   const body: Record<string, unknown> = {
     messages,
     model: options.model,
-    config: {
-      frozen_message_count: 0,
-      mode: "lossy_inline",
-      compress_user_messages: true,
-      protect_recent: 0,
-    },
+    config: resolveDurableCompressConfig(),
   };
   if (options.tokenBudget !== undefined) {
     body.token_budget = options.tokenBudget;
@@ -263,6 +259,9 @@ function buildCompactionPlanFromCompressResult(options: {
 
   if (compressedAgent.length === originals.length) {
     const replacements = branchMessages.flatMap((entry, index) => {
+      if (messageHasProtectedToolPayload(entry.message)) {
+        return [];
+      }
       const merged = mergeCompressedMessage(entry.message, compressedAgent[index]);
       if (!messagePayloadChanged(entry.message, merged)) {
         return [];

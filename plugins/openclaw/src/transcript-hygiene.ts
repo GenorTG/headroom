@@ -24,6 +24,8 @@ export interface TranscriptHygieneSettings {
   enabled?: boolean;
   /** Run replace hygiene when branch tokens exceed this (default: half of token budget or 400k). */
   softThresholdTokens?: number;
+  /** Skip another hygiene rewrite on the same session within this window (default: 30s). */
+  debounceMs?: number;
 }
 
 export interface TranscriptHygieneRuntimeParams {
@@ -48,6 +50,8 @@ export interface TranscriptHygieneRuntimeParams {
   abortSignal?: AbortSignal;
 }
 
+const DEFAULT_HYGIENE_DEBOUNCE_MS = 30_000;
+
 export function resolveTranscriptHygieneSettings(
   config: TranscriptHygieneConfig,
   persistentCompactionMode: "headroom" | "openclaw" | "hybrid",
@@ -55,12 +59,14 @@ export function resolveTranscriptHygieneSettings(
   const raw = config.transcriptHygiene;
   let enabled: boolean;
   let softThresholdTokens: number | undefined;
+  let debounceMs: number | undefined;
 
   if (typeof raw === "boolean") {
     enabled = raw;
   } else if (raw && typeof raw === "object") {
     enabled = raw.enabled ?? persistentCompactionMode === "hybrid";
     softThresholdTokens = raw.softThresholdTokens;
+    debounceMs = raw.debounceMs;
   } else {
     enabled = persistentCompactionMode === "hybrid";
   }
@@ -68,6 +74,7 @@ export function resolveTranscriptHygieneSettings(
   return {
     enabled,
     softThresholdTokens: softThresholdTokens ?? 0,
+    debounceMs: debounceMs ?? DEFAULT_HYGIENE_DEBOUNCE_MS,
   };
 }
 

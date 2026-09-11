@@ -1,0 +1,81 @@
+# OpenClaw plugin PR — overview vs upstream `main`
+
+This document describes **why** this PR exists, **what** each area changes compared to stock
+`headroomlabs-ai/headroom:main`, and **where** to look in the tree. It contains no operator-specific
+paths or credentials.
+
+## Problem statement (stock `main` gaps)
+
+| # | Stock behavior | After this PR |
+|---|----------------|---------------|
+| 1 | OpenClaw 2026.9.x bypasses the Headroom engine every turn when `transcriptSemantics` / durable `commitTurn()` are missing → `assemble()` never runs | Engine declares semantics; durable turn advancement persists accepted messages |
+| 2 | One proxy env var → one upstream; multi-provider deployments 404 at the proxy | `providerUpstreams` + `x-headroom-base-url` per provider |
+| 3 | Providers with non-`/v1` first-party URLs fail when rewritten to the proxy | Protocol-aware `resolveProxyPathPrefix()` (`/v1` vs `/v1beta` for Gemini) |
+| 4 | Session-gated APIs (e.g. opencode-go) return 400 without a session header | `providerSessionHeaders` injects a stable per-process UUID |
+| 5 | `compact()` / `maintain()` were no-ops despite `ownsCompaction` | Real durable compaction via Headroom `/v1/compress` + SQLite rewrite |
+| 6 | `assemble()` always hit the proxy, even far under token budget | Budget short-circuit (~85% of `tokenBudget`) |
+| 7 | Tool payloads mangled in `convert.ts` (images, tool names, assistant blocks) | Structured serialization + metadata round-trip |
+| 8 | Misleading `headroom_retrieve` hint without CCR hashes | Hint gated on `ccrHashes.length > 0` |
+| 9 | Double compression when gateway providers route through proxy | Opt-in `skipAssembleWhenGatewayRouted` |
+| 10 | Durable hygiene used `protect_recent: 0` | Default `protect_recent: 2`; skip rewrite of protected tool/image payloads |
+
+## File-level diff map (vs `main`)
+
+### Core runtime
+
+| File | Role |
+|------|------|
+| `src/engine.ts` | `assemble()`, `compact()`, `maintain()`, `commitTurn()`; budget skip; CCR hint gating; gateway-routed assemble skip; hybrid/openclaw compaction modes |
+| `src/convert.ts` | AgentMessage ↔ OpenAI conversion; image/tool block preservation; tool `name`; user `tool_result` blocks; `isError` inference |
+| `src/compaction.ts` | Durable `/v1/compress` planning + SQLite apply; protected-payload skip on replace |
+| `src/compaction-mode.ts` | `persistentCompaction`: `openclaw` (default), `hybrid`, `headroom` |
+| `src/compress-request-config.ts` | Shared assemble + durable compress config defaults (`protect_recent: 2`) |
+| `src/turn-advancement-store.ts` | Idempotent on-disk turn advancement keyed by `advancementKey` |
+| `src/gateway-config.ts` | In-memory provider rewrite; `providerUpstreams`; `providerSessionHeaders` |
+| `src/proxy-routing.ts` | `/v1` vs `/v1beta` pathname normalization |
+| `src/session-headers.ts` | Per-provider session UUID generation |
+| `src/transcript-hygiene.ts` | Turn-end replace-only hygiene (hybrid mode) |
+| `src/hygiene-debounce.ts` | Per-session debounce for hygiene rewrites |
+| `src/transcript-projection.ts` | Wait for OpenClaw transcript projection after rewrites |
+| `src/openclaw-compaction.ts` | Delegate durable compaction to OpenClaw native when configured |
+| `src/plugin/index.ts` | Plugin registration; reads new config keys |
+
+### Config & packaging
+
+| File | Role |
+|------|------|
+| `openclaw.plugin.json` | Schema for routing, compaction modes, hygiene, `assembleCompressConfig`, `skipAssembleWhenGatewayRouted` |
+| `package.json` | Aligns `headroom-ai` with monorepo release (`^0.37.0`); stress test scripts |
+| `package-lock.json` | Locked deps (merged from upstream #3531) |
+
+### Documentation
+
+| File | Role |
+|------|------|
+| `README.md` | Operator-facing config + proxy env mitigations |
+| `docs/tool-call-preservation.md` | Tool-call bug analysis, fix phases, staging checklist |
+| `docs/PR_OVERVIEW.md` | This file |
+| `docs/TEST_MATRIX.md` | Test coverage map for the full PR |
+| `PR_BODY.md` | GitHub PR description (sanitized) |
+
+### Tests
+
+See [TEST_MATRIX.md](./TEST_MATRIX.md). Summary: **208+ unit/integration tests**, optional live proxy stress scripts.
+
+## Merge with upstream `main` (2026-09-11)
+
+This branch integrates these upstream commits not previously on `pr-prep`:
+
+- `#3521` — dependency security remediation (monorepo-wide)
+- `#3516` — Node 24 for npm release packaging
+- `#3531` — consolidated dependency updates; **`plugins/openclaw/package-lock.json`** bumped
+
+No upstream changes conflict with plugin source logic; only dependency lockfiles required reconciliation.
+
+## Default behavior vs opt-in features
+
+**Unchanged for stock installs:** `persistentCompaction: "openclaw"`, hygiene off, `skipAssembleWhenGatewayRouted: false`.
+
+**Always-on fixes (no config required):** transcript semantics, `commitTurn` contract, conversion preservation, assemble budget short-circuit, safer durable compress defaults when compaction modes are enabled.
+
+**Opt-in:** multi-upstream routing maps, session headers, hybrid/headroom compaction, gateway assemble skip, custom `assembleCompressConfig`.

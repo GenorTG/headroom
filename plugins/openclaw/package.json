@@ -14,11 +14,13 @@
   "scripts": {
     "build": "tsup && node prepare-dist.mjs",
     "test": "vitest run",
+    "test:stress": "vitest run test/stress",
+    "test:live-stress": "node test/live-compress-stress.mjs",
     "test:watch": "vitest",
     "typecheck": "node node_modules/@typescript/native/bin/tsc --noEmit"
   },
   "dependencies": {
-    "headroom-ai": "^0.22.3"
+    "headroom-ai": "^0.37.0"
   },
   "peerDependencies": {
     "openclaw": "*"

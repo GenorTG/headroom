@@ -38,6 +38,7 @@ import {
   type OpenClawCompactParams,
   type OpenClawCompactResult,
 } from "./openclaw-compaction.js";
+import { HygieneDebounceTracker } from "./hygiene-debounce.js";
 import {
   resolveSoftThresholdTokens,
   resolveTranscriptHygieneSettings,
@@ -45,6 +46,12 @@ import {
   type TranscriptHygieneConfig,
   type TranscriptHygieneRuntimeParams,
 } from "./transcript-hygiene.js";
+import { awaitTranscriptProjectionSettle } from "./transcript-projection.js";
+import {
+  resolveAssembleCompressConfig,
+  type CompressRequestConfig,
+} from "./compress-request-config.js";
+import { resolveGatewayProviderIds } from "./gateway-config.js";
 
 type HeadroomCompactParams = OpenClawCompactParams & {
   sessionTarget?: {
@@ -81,8 +88,22 @@ export interface HeadroomEngineConfig
   requestTimeoutMs?: number;
   circuitBreakerThreshold?: number;
   circuitBreakerCooldownMs?: number;
+  /**
+   * Max milliseconds to wait for OpenClaw transcript projection to settle after
+   * hygiene rewrites. Set 0 to disable. Default: 120s.
+   */
+  transcriptProjectionWaitMs?: number;
   /** Override durable turn-advancement store path (primarily for tests). */
   turnAdvancementStorePath?: string;
+  /** Per-turn `/v1/compress` config (default: `{ protect_recent: 2 }`). */
+  assembleCompressConfig?: CompressRequestConfig;
+  /**
+   * Skip `assemble()` compression when `gatewayProviderIds` route live provider
+   * traffic through the proxy (avoids double compression — see BUG-6). Default: false.
+   */
+  skipAssembleWhenGatewayRouted?: boolean;
+  gatewayProviderIds?: string[];
+  routeCodexViaProxy?: boolean;
 }
 
 /** OpenClaw 2026.9.x turn contract — required even when OpenClaw owns compaction (hybrid/openclaw). */
@@ -123,6 +144,8 @@ export class HeadroomContextEngine {
   private circuit = { errors: 0, openUntilMs: 0 };
   private pendingCompactions = new Map<string, PendingCompaction>();
   private turnAdvancementStores = new Map<string, TurnAdvancementStore>();
+  private readonly hygieneDebounce = new HygieneDebounceTracker();
+  private readonly transcriptProjectionWaitMs: number;
 
   constructor(config: HeadroomEngineConfig = {}, logger?: ProxyManagerLogger) {
     this.config = config;
@@ -131,6 +154,7 @@ export class HeadroomContextEngine {
       config,
       this.persistentCompactionMode,
     );
+    this.transcriptProjectionWaitMs = config.transcriptProjectionWaitMs ?? 120_000;
     this.logger = logger ?? defaultLogger;
     this.proxyManager = new ProxyManager(config, this.logger);
   }
@@ -195,6 +219,23 @@ export class HeadroomContextEngine {
     }
 
     try {
+      const gatewayProviderIds = resolveGatewayProviderIds(
+        this.config as unknown as Record<string, unknown>,
+      );
+      if (
+        this.config.skipAssembleWhenGatewayRouted === true &&
+        gatewayProviderIds.length > 0
+      ) {
+        const roughTokens = estimateRoughTokens(params.messages);
+        this.logger.debug(
+          `Assemble skip: gateway-routed providers (${gatewayProviderIds.join(", ")})`,
+        );
+        return {
+          messages: normalizeAgentMessages(params.messages),
+          estimatedTokens: roughTokens,
+        };
+      }
+
       const budget = params.tokenBudget;
       if (budget != null && budget > 0) {
         const roughTokens = estimateRoughTokens(params.messages);
@@ -213,6 +254,9 @@ export class HeadroomContextEngine {
 
       // Convert AgentMessage → OpenAI format
       const openaiMessages = agentToOpenAI(params.messages);
+      const assembleCompressConfig = resolveAssembleCompressConfig(
+        this.config.assembleCompressConfig,
+      );
 
       // Compress via proxy — pass tokenBudget so RollingWindow enforces it
       const result = await withTimeout(
@@ -221,6 +265,7 @@ export class HeadroomContextEngine {
           baseUrl: this.proxyUrl,
           fallback: true,
           tokenBudget: params.tokenBudget,
+          config: assembleCompressConfig,
         } as any),
         this.config.requestTimeoutMs ?? 30_000,
       );
@@ -246,11 +291,12 @@ export class HeadroomContextEngine {
         `Assembled: ${result.tokensBefore} → ${result.tokensAfter} tokens (saved ${result.tokensSaved})`,
       );
 
+      const ccrHashes = Array.isArray(result.ccrHashes) ? result.ccrHashes : [];
       return {
         messages: compressedAgentMessages,
         estimatedTokens: result.tokensAfter,
         systemPromptAddition:
-          result.tokensSaved > 100
+          result.tokensSaved > 100 && ccrHashes.length > 0
             ? `[Context compressed by Headroom: ${result.tokensSaved} tokens saved. Use headroom_retrieve with the hash to get full details.]`
             : undefined,
       };
@@ -273,8 +319,16 @@ export class HeadroomContextEngine {
     params.abortSignal?.throwIfAborted();
 
     if (delegatesPersistentCompaction(this.persistentCompactionMode)) {
-      if (this.persistentCompactionMode === "hybrid") {
-        await this.runTranscriptHygienePass(params as HeadroomCompactParams, { force: true });
+      // Hybrid pre-pass rewrites SQLite in-place — only when transcript hygiene
+      // is explicitly enabled. Never bypass enabled:false via force:true.
+      if (
+        this.persistentCompactionMode === "hybrid" &&
+        this.transcriptHygieneSettings.enabled
+      ) {
+        await this.runTranscriptHygienePass(params as HeadroomCompactParams, {
+          force: true,
+          compactPrepass: true,
+        });
       }
       return this.delegateOpenClawCompaction(params);
     }
@@ -409,6 +463,7 @@ export class HeadroomContextEngine {
         this.logger.info(
           `Compact persisted: freed ~${result.bytesFreed} bytes across ${result.rewrittenEntries} entries`,
         );
+        await this.awaitTranscriptProjectionAfterRewrite(params, params.abortSignal);
       }
 
       return result;
@@ -617,10 +672,25 @@ export class HeadroomContextEngine {
       sessionKey?: string;
       sessionTarget?: HeadroomCompactParams["sessionTarget"];
       sessionFile?: string;
+      abortSignal?: AbortSignal;
     },
-    options: { force: boolean },
+    options: { force: boolean; compactPrepass?: boolean },
   ): Promise<{ changed: boolean; bytesFreed: number; rewrittenEntries: number; reason?: string }> {
-    if (!this.transcriptHygieneSettings.enabled && !options.force) {
+    if (
+      this.shouldDebounceHygiene(params.sessionId, {
+        force: options.force,
+        compactPrepass: options.compactPrepass,
+      })
+    ) {
+      return {
+        changed: false,
+        bytesFreed: 0,
+        rewrittenEntries: 0,
+        reason: "debounced",
+      };
+    }
+
+    if (!this.transcriptHygieneSettings.enabled) {
       return {
         changed: false,
         bytesFreed: 0,
@@ -663,12 +733,14 @@ export class HeadroomContextEngine {
       if (result.changed) {
         this.stats.hygieneRuns++;
         this.stats.hygieneBytesFreed += result.bytesFreed;
+        this.hygieneDebounce.recordChanged(params.sessionId);
         this.logger.info(
           `Transcript hygiene: freed ~${result.bytesFreed} bytes across ${result.rewrittenEntries} entries` +
             (result.tokensBefore !== undefined
               ? ` (${result.tokensBefore} → ${result.tokensAfter ?? result.tokensBefore} tokens)`
               : ""),
         );
+        await this.awaitTranscriptProjectionAfterRewrite(params, params.abortSignal);
       }
 
       return result;
@@ -680,6 +752,42 @@ export class HeadroomContextEngine {
         rewrittenEntries: 0,
         reason: String(error),
       };
+    }
+  }
+
+  private shouldDebounceHygiene(
+    sessionId: string,
+    options: { force: boolean; compactPrepass?: boolean },
+  ): boolean {
+    if (!options.force || options.compactPrepass) {
+      return this.hygieneDebounce.shouldSkip(
+        sessionId,
+        this.transcriptHygieneSettings.debounceMs,
+      );
+    }
+    return false;
+  }
+
+  private async awaitTranscriptProjectionAfterRewrite(
+    params: {
+      sessionId: string;
+      sessionKey?: string;
+      sessionTarget?: HeadroomCompactParams["sessionTarget"];
+      runtimeContext?: HeadroomCompactParams["runtimeContext"];
+    },
+    abortSignal?: AbortSignal,
+  ): Promise<void> {
+    const settle = await awaitTranscriptProjectionSettle({
+      params,
+      runtimeContext: params.runtimeContext,
+      abortSignal,
+      timeoutMs: this.transcriptProjectionWaitMs,
+      logger: this.logger,
+    });
+    if (!settle.waited && settle.reason && settle.reason !== "projection wait disabled") {
+      this.logger.debug?.(
+        `[headroom] Transcript projection settle skipped: ${settle.reason}`,
+      );
     }
   }
 }

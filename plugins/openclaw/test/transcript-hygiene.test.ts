@@ -9,6 +9,7 @@ describe("resolveTranscriptHygieneSettings", () => {
     expect(resolveTranscriptHygieneSettings({}, "hybrid")).toEqual({
       enabled: true,
       softThresholdTokens: 0,
+      debounceMs: 30_000,
     });
   });
 
@@ -16,6 +17,7 @@ describe("resolveTranscriptHygieneSettings", () => {
     expect(resolveTranscriptHygieneSettings({}, "openclaw")).toEqual({
       enabled: false,
       softThresholdTokens: 0,
+      debounceMs: 30_000,
     });
   });
 
@@ -23,15 +25,17 @@ describe("resolveTranscriptHygieneSettings", () => {
     expect(resolveTranscriptHygieneSettings({ transcriptHygiene: false }, "hybrid")).toEqual({
       enabled: false,
       softThresholdTokens: 0,
+      debounceMs: 30_000,
     });
     expect(
       resolveTranscriptHygieneSettings(
-        { transcriptHygiene: { enabled: true, softThresholdTokens: 250_000 } },
+        { transcriptHygiene: { enabled: true, softThresholdTokens: 250_000, debounceMs: 5_000 } },
         "openclaw",
       ),
     ).toEqual({
       enabled: true,
       softThresholdTokens: 250_000,
+      debounceMs: 5_000,
     });
   });
 });
