@@ -53,6 +53,16 @@ async function main() {
     process.exit(1);
   }
 
+  const imageData = transcript
+    .flatMap((m) => (Array.isArray(m.content) ? m.content : []))
+    .filter((b) => b?.type === "image")
+    .map((b) => b.data);
+  const wire = JSON.stringify(openaiMessages);
+  if (imageData.some((data) => wire.includes(data))) {
+    console.error("FAIL: image bytes would be sent to the proxy");
+    process.exit(1);
+  }
+
   const body = {
     messages: openaiMessages,
     model: "claude-sonnet-4-5",
@@ -75,7 +85,7 @@ async function main() {
   }
 
   const data = await response.json();
-  const restored = openAIToAgent(data.messages);
+  const restored = openAIToAgent(data.messages, { originals: transcript });
   const viewResult = restored.find(
     (m) => m.role === "toolResult" && m.toolName === "view_image",
   );

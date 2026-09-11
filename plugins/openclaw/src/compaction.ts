@@ -5,7 +5,8 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
 import { resolveDurableCompressConfig } from "./compress-request-config.js";
-import { agentToOpenAI, messageHasProtectedToolPayload, openAIToAgent } from "./convert.js";
+import { messageHasProtectedToolPayload } from "./content-blocks.js";
+import { agentToOpenAI, openAIToAgent } from "./convert.js";
 
 type SessionManagerLike = {
   getBranch(): unknown[];
@@ -255,7 +256,7 @@ function buildCompactionPlanFromCompressResult(options: {
     return { mode: "none", tokensBefore, tokensAfter: tokensBefore };
   }
 
-  const compressedAgent = openAIToAgent(result.messages);
+  const compressedAgent = openAIToAgent(result.messages, { originals });
 
   if (compressedAgent.length === originals.length) {
     const replacements = branchMessages.flatMap((entry, index) => {

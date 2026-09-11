@@ -51,7 +51,7 @@ import {
   resolveAssembleCompressConfig,
   type CompressRequestConfig,
 } from "./compress-request-config.js";
-import { resolveGatewayProviderIds } from "./gateway-config.js";
+import { decideAssembleSkip, providerIdFromRuntimeSettings } from "./assemble-skip.js";
 
 type HeadroomCompactParams = OpenClawCompactParams & {
   sessionTarget?: {
@@ -98,8 +98,10 @@ export interface HeadroomEngineConfig
   /** Per-turn `/v1/compress` config (default: `{ protect_recent: 2 }`). */
   assembleCompressConfig?: CompressRequestConfig;
   /**
-   * Skip `assemble()` compression when `gatewayProviderIds` route live provider
-   * traffic through the proxy (avoids double compression — see BUG-6). Default: false.
+   * Skip `assemble()` compression when the current model's provider is routed
+   * through the proxy via `gatewayProviderIds` (avoids double compression — see
+   * BUG-6). Providers that are not routed still get `assemble()` compression.
+   * Default: false.
    */
   skipAssembleWhenGatewayRouted?: boolean;
   gatewayProviderIds?: string[];
@@ -202,6 +204,8 @@ export class HeadroomContextEngine {
     tokenBudget?: number;
     model?: string;
     prompt?: string;
+    /** OpenClaw runtime settings; `model.provider` drives the gateway-routed skip. */
+    runtimeSettings?: unknown;
   }): Promise<{
     messages: any[];
     estimatedTokens: number;
@@ -219,17 +223,13 @@ export class HeadroomContextEngine {
     }
 
     try {
-      const gatewayProviderIds = resolveGatewayProviderIds(
-        this.config as unknown as Record<string, unknown>,
-      );
-      if (
-        this.config.skipAssembleWhenGatewayRouted === true &&
-        gatewayProviderIds.length > 0
-      ) {
+      const skipDecision = decideAssembleSkip({
+        config: this.config as unknown as Record<string, unknown>,
+        providerId: providerIdFromRuntimeSettings(params.runtimeSettings),
+      });
+      if (skipDecision.skip) {
         const roughTokens = estimateRoughTokens(params.messages);
-        this.logger.debug(
-          `Assemble skip: gateway-routed providers (${gatewayProviderIds.join(", ")})`,
-        );
+        this.logger.debug(`Assemble skip: ${skipDecision.reason}`);
         return {
           messages: normalizeAgentMessages(params.messages),
           estimatedTokens: roughTokens,
@@ -278,8 +278,11 @@ export class HeadroomContextEngine {
         };
       }
 
-      // Convert back to AgentMessage format
-      const compressedAgentMessages = openAIToAgent(result.messages);
+      // Convert back to AgentMessage format, restoring images/tool blocks/metadata
+      // from the originals (the proxy does not reliably echo `_headroomMeta`).
+      const compressedAgentMessages = openAIToAgent(result.messages, {
+        originals: params.messages,
+      });
       this.resetCircuit();
 
       // Track stats

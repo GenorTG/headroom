@@ -3,12 +3,8 @@
  * Validates what goes into compress vs what comes back out.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  agentToOpenAI,
-  messageHasProtectedToolPayload,
-  openAIToAgent,
-  type OpenAIMessage,
-} from "../../src/convert.js";
+import { messageHasProtectedToolPayload } from "../../src/content-blocks.js";
+import { agentToOpenAI, openAIToAgent, type OpenAIMessage } from "../../src/convert.js";
 import {
   NATIVE_TOOL_SCENARIOS,
   buildMegaTranscript,
@@ -160,13 +156,13 @@ describe("native tool conversion stress", () => {
     NATIVE_TOOL_SCENARIOS.filter((s) => s.mustPreserveStructured).map(
       (s) => [s.toolName, s] as const,
     ),
-  )("%s survives lossy OpenAI round-trip via metadata", (toolName, scenario) => {
+  )("%s survives lossy OpenAI round-trip with _headroomMeta stripped", (toolName, scenario) => {
     const transcript = buildToolScenarioTranscript(scenario, 0);
     const openai = agentToOpenAI(transcript);
-    const crushed = openai.map((msg) =>
+    const crushed = openai.map(({ _headroomMeta: _dropped, ...msg }) =>
       msg.role === "tool" ? { ...msg, content: "[TOTAL LOSS]" } : msg,
     );
-    const restored = openAIToAgent(crushed);
+    const restored = openAIToAgent(crushed, { originals: transcript });
     assertStructuredPayloadPreserved(transcript, restored, toolName === "assistant" ? "read" : toolName);
     if (toolName === "view_image") {
       assertStructuredPayloadPreserved(transcript, restored, "view_image");
@@ -192,6 +188,20 @@ describe("native tool conversion stress", () => {
     const mega = buildMegaTranscript(120);
     const protectedCount = mega.filter((m) => messageHasProtectedToolPayload(m)).length;
     expect(protectedCount).toBeGreaterThan(5);
+  });
+
+  it("mega transcript: no base64 image bytes are ever sent to the proxy", () => {
+    const mega = buildMegaTranscript(120);
+    const imageData = extractToolResults(mega)
+      .flatMap((r) => (Array.isArray(r.content) ? r.content : []))
+      .map((b) => (b as { data?: string }).data)
+      .filter((d): d is string => typeof d === "string" && d.length > 0);
+    expect(imageData.length).toBeGreaterThan(0);
+
+    const wire = JSON.stringify(agentToOpenAI(mega));
+    for (const data of imageData) {
+      expect(wire).not.toContain(data);
+    }
   });
 });
 
@@ -266,7 +276,7 @@ describe("native tool assemble() stress (mock proxy)", () => {
     }
   });
 
-  it("assemble with dropMeta crush loses image blocks (documents _headroomMeta dependency)", async () => {
+  it("assemble with dropMeta crush still restores image blocks (no _headroomMeta dependency)", async () => {
     mockAggressiveCompress({ dropMeta: true });
     const scenario = NATIVE_TOOL_SCENARIOS.find(
       (s) => s.toolName === "view_image" && s.payloadKind === "image",
@@ -275,11 +285,24 @@ describe("native tool assemble() stress (mock proxy)", () => {
     const engine = new HeadroomContextEngine();
     (engine as { proxyUrl: string | null }).proxyUrl = "http://127.0.0.1:8787";
     const result = await engine.assemble({ sessionId: "drop-meta", messages: transcript });
+    assertStructuredPayloadPreserved(transcript, result.messages, "view_image");
     const view = extractToolResults(result.messages).find((r) => r.toolName === "view_image");
-    const hasImage = Array.isArray(view?.content) &&
-      view.content.some((b) => typeof b === "object" && b !== null && (b as { type?: string }).type === "image");
-    expect(hasImage).toBe(false);
     expect((view?.content as Array<{ text?: string }>)?.[0]?.text).toContain("CRUSHED");
+  });
+
+  it("assemble with dropMeta crush restores isError on error tool results", async () => {
+    mockAggressiveCompress({ dropMeta: true });
+    const scenario = NATIVE_TOOL_SCENARIOS.find(
+      (s) => s.toolName === "view_image" && s.payloadKind === "error",
+    ) as NativeToolScenario;
+    const transcript = buildToolScenarioTranscript(scenario, 7);
+    const engine = new HeadroomContextEngine();
+    (engine as { proxyUrl: string | null }).proxyUrl = "http://127.0.0.1:8787";
+    const result = await engine.assemble({ sessionId: "drop-meta-err", messages: transcript });
+    const before = extractToolResults(transcript).find((r) => r.toolName === "view_image");
+    const after = extractToolResults(result.messages).find((r) => r.toolName === "view_image");
+    expect(before?.isError).toBe(true);
+    expect(after?.isError).toBe(true);
   });
 
   it("text-only tools survive assemble with lossy but structured toolResult blocks", async () => {

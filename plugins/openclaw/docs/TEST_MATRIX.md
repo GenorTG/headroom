@@ -4,7 +4,7 @@ Run everything:
 
 ```bash
 cd plugins/openclaw
-npm test                    # 208+ vitest cases
+npm test                    # 261 vitest cases
 npm run typecheck
 npm run build
 npm run test:stress         # native-tool mock stress
@@ -48,18 +48,22 @@ npm run test:live-stress    # optional; requires Headroom proxy on :8787
 |----------|------------------------|-----------|
 | Budget short-circuit (~85%) | Every turn hit proxy | `test/engine.test.ts` |
 | `assembleCompressConfig` passed to SDK | No per-turn protect_recent | `test/engine.test.ts`, `test/stress/...` |
-| `skipAssembleWhenGatewayRouted` | Double compression | `test/engine.test.ts`, `test/tool-call-preservation.integration.test.ts` |
+| `skipAssembleWhenGatewayRouted` (provider-aware) | Double compression; blanket skip would disable compression for direct providers | `test/assemble-skip.test.ts`, `test/engine.test.ts`, `test/tool-call-preservation.integration.test.ts` |
 | CCR hint only with hashes | False retrieve spirals | `test/engine.test.ts`, `test/tool-call-preservation.integration.test.ts` |
 
 ## Pillar 5 — Tool-call preservation
 
 | Behavior | Why stock `main` fails | Test file |
 |----------|------------------------|-----------|
-| Image blocks in toolResult | Stripped by `extractText()` | `test/convert.test.ts` |
+| Image bytes never sent to proxy | Stock dropped them; earlier iteration sent base64 twice | `test/convert.test.ts`, `test/stress/...` (mega no-base64) |
+| Image blocks restored with meta echoed **or** stripped | Stripped by `extractText()`; proxy echo unreliable | `test/convert.test.ts`, `test/tool-call-preservation.integration.test.ts` |
+| Wire placeholders + text merge | Structure lost on lossy rewrite | `test/content-blocks.test.ts` |
+| Original lookup by `tool_call_id` / hint / position | N/A on stock | `test/original-lookup.test.ts` |
 | OpenAI `tool.name` from `toolName` | Proxy protect-list miss | `test/convert.test.ts`, `test/stress/...` |
-| Assistant thinking/toolCall blocks | Unknown blocks dropped | `test/convert.test.ts` |
+| Assistant thinking/toolCall blocks; no text duplication | Unknown blocks dropped | `test/convert.test.ts` |
 | User embedded `tool_result` | Flattened to text | `test/convert.test.ts` |
-| `isError` after meta strip | Lost on proxy round-trip | `test/convert.test.ts` |
+| `isError` after meta strip | Lost on proxy round-trip | `test/convert.test.ts`, `test/stress/...` |
+| Image token estimate | Budget skip defeated by base64 length | `test/convert.test.ts` |
 | End-to-end assemble + mock crush | Real failure mode | `test/tool-call-preservation.integration.test.ts` |
 | All native OpenClaw tools | Regression breadth | `test/stress/openclaw-tools.stress.test.ts` |
 | Live proxy `/v1/compress` | Production validation | `test/live-compress-smoke.mjs`, `test/live-compress-stress.mjs` |

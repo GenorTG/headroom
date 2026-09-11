@@ -66,7 +66,7 @@ export const NATIVE_TOOL_SCENARIOS: NativeToolScenario[] = [
     buildTurn: (i) => {
       const id = `call_exec_${i}`;
       return [
-        assistantToolCall("exec", id, { command: "ls -la /home/genorbox1/.openclaw" }, i * 10 + 1),
+        assistantToolCall("exec", id, { command: "ls -la /srv/openclaw" }, i * 10 + 1),
         toolResult("exec", id, [{ type: "text", text: largeText(80) }], i * 10 + 2),
       ];
     },
@@ -138,7 +138,7 @@ export const NATIVE_TOOL_SCENARIOS: NativeToolScenario[] = [
           [
             {
               type: "text",
-              text: `Screenshot saved to /home/genorbox1/.openclaw/media/outbound/shot-${i}.png`,
+              text: `Screenshot saved to /srv/openclaw/media/outbound/shot-${i}.png`,
             },
           ],
           i * 10 + 2,

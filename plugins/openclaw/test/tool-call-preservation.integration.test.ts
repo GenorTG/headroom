@@ -100,21 +100,23 @@ function godotVisionTranscript() {
   ];
 }
 
-/** Simulates proxy lossy-compressing tool message strings but returning OpenAI-shaped messages. */
-function mockLossyCompress(options?: { ccrHashes?: string[] }) {
+/**
+ * Simulates proxy lossy-compressing tool message strings but returning OpenAI-shaped messages.
+ * `dropMeta` mimics proxy transforms that rebuild message objects and drop `_headroomMeta`.
+ */
+function mockLossyCompress(options?: { ccrHashes?: string[]; dropMeta?: boolean }) {
   vi.mocked(compress).mockImplementation(async (messages) => {
     const openaiIn = messages as OpenAIMessage[];
     const compressed = openaiIn.map((msg) => {
+      const next: OpenAIMessage = { ...msg };
+      if (options?.dropMeta) delete next._headroomMeta;
       if (msg.role === "tool") {
-        return {
-          ...msg,
-          content: "[lossy summary of tool output]",
-        };
+        return { ...next, content: "[lossy summary of tool output]" };
       }
       if (msg.role === "assistant" && msg.content && msg.content.length > 200) {
-        return { ...msg, content: msg.content.slice(0, 200) + "…" };
+        return { ...next, content: msg.content.slice(0, 200) + "…" };
       }
-      return msg;
+      return next;
     });
 
     return {
@@ -131,7 +133,7 @@ function mockLossyCompress(options?: { ccrHashes?: string[] }) {
 }
 
 describe("tool-call preservation mock integration", () => {
-  it("agentToOpenAI emits tool names and structured image payloads for proxy protect lists", () => {
+  it("agentToOpenAI emits tool names and keeps image bytes off the wire", () => {
     const openai = agentToOpenAI(godotVisionTranscript());
     const viewImage = openai.find((msg) => msg.role === "tool" && msg.name === "view_image");
     const browser = openai.find((msg) => msg.role === "tool" && msg.name === "browser");
@@ -140,13 +142,9 @@ describe("tool-call preservation mock integration", () => {
       role: "tool",
       name: "view_image",
       tool_call_id: "call_view_1",
+      content: "[headroom-omitted image image/png 33 bytes]",
     });
-    expect(viewImage?.content).toContain("__HR_TOOL_BLOCKS__");
-    expect(viewImage?._headroomMeta?.toolContentBlocks).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({ type: "image", mimeType: "image/png" }),
-      ]),
-    );
+    expect(JSON.stringify(openai)).not.toContain("iVBORw0KGgo");
     expect(browser).toMatchObject({
       role: "tool",
       name: "browser",
@@ -154,8 +152,11 @@ describe("tool-call preservation mock integration", () => {
     });
   });
 
-  it("assemble() restores view_image bytes after mock lossy proxy compression", async () => {
-    mockLossyCompress();
+  it.each([
+    ["meta echoed", false],
+    ["meta dropped by proxy", true],
+  ])("assemble() restores view_image bytes after mock lossy proxy compression (%s)", async (_label, dropMeta) => {
+    mockLossyCompress({ dropMeta });
 
     const engine = new HeadroomContextEngine({
       assembleCompressConfig: { protect_recent: 2 },
@@ -170,13 +171,19 @@ describe("tool-call preservation mock integration", () => {
     const viewResult = result.messages.find(
       (msg) => msg.role === "toolResult" && msg.toolName === "view_image",
     );
+    // The image-only tool result gets the lossy text folded in front of the image.
     expect(viewResult?.content).toEqual([
+      { type: "text", text: "[lossy summary of tool output]" },
       {
         type: "image",
         data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ",
         mimeType: "image/png",
       },
     ]);
+    expect(viewResult).toMatchObject({ toolCallId: "call_view_1", isError: false, timestamp: 5 });
+
+    const assistants = result.messages.filter((msg) => msg.role === "assistant");
+    expect(assistants.map((msg) => msg.provider)).toEqual(["anthropic", "anthropic"]);
     expect(result.systemPromptAddition).toBeUndefined();
   });
 
@@ -221,7 +228,7 @@ describe("tool-call preservation mock integration", () => {
     );
   });
 
-  it("skipAssembleWhenGatewayRouted bypasses compress for gateway-routed deployments", async () => {
+  it("skipAssembleWhenGatewayRouted bypasses compress for a gateway-routed provider", async () => {
     const engine = new HeadroomContextEngine({
       skipAssembleWhenGatewayRouted: true,
       gatewayProviderIds: ["openrouter", "minimax-portal"],
@@ -232,6 +239,7 @@ describe("tool-call preservation mock integration", () => {
     const result = await engine.assemble({
       sessionId: "godot-dashboard",
       messages,
+      runtimeSettings: { model: { provider: "openrouter" } },
     });
 
     expect(compress).not.toHaveBeenCalled();
@@ -245,15 +253,32 @@ describe("tool-call preservation mock integration", () => {
     );
   });
 
-  it("full round-trip: OpenClaw → OpenAI → lossy OpenAI → OpenClaw keeps toolCall + image", () => {
+  it("skipAssembleWhenGatewayRouted still compresses for a provider that is not routed", async () => {
+    mockLossyCompress();
+    const engine = new HeadroomContextEngine({
+      skipAssembleWhenGatewayRouted: true,
+      gatewayProviderIds: ["openrouter"],
+    });
+    (engine as { proxyUrl: string | null }).proxyUrl = "http://127.0.0.1:8787";
+
+    await engine.assemble({
+      sessionId: "godot-dashboard",
+      messages: godotVisionTranscript(),
+      runtimeSettings: { model: { provider: "anthropic" } },
+    });
+
+    expect(compress).toHaveBeenCalledTimes(1);
+  });
+
+  it("full round-trip: OpenClaw → OpenAI → lossy OpenAI (meta stripped) → OpenClaw keeps toolCall + image", () => {
     const original = godotVisionTranscript();
     const openai = agentToOpenAI(original);
 
-    const lossyOpenai = openai.map((msg) =>
+    const lossyOpenai = openai.map(({ _headroomMeta: _dropped, ...msg }) =>
       msg.role === "tool" ? { ...msg, content: "[lossy]" } : msg,
     );
 
-    const restored = openAIToAgent(lossyOpenai);
+    const restored = openAIToAgent(lossyOpenai, { originals: original });
     const viewResult = restored.find(
       (msg) => msg.role === "toolResult" && msg.toolName === "view_image",
     );
@@ -265,6 +290,7 @@ describe("tool-call preservation mock integration", () => {
     );
 
     expect(viewResult?.content).toEqual([
+      { type: "text", text: "[lossy]" },
       expect.objectContaining({ type: "image", mimeType: "image/png" }),
     ]);
     expect(assistantWithBrowser?.content).toEqual(

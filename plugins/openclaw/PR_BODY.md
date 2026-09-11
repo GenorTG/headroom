@@ -77,7 +77,7 @@ Thanks for the detailed review on `656ea3f`. Both blockers are addressed in the 
   - **P1:** Replaces the no-op `commitTurn()` with a durable, idempotent store keyed by `advancementKey`, using the OpenClaw contract field `messages` (not `acceptedTurn`). Persists the full accepted `messages` payload to disk, returns `{ status: "duplicate" }` on retry, and includes restart/retry/failed-write tests.
   - **P2:** Adds protocol-aware proxy pathname normalization via `resolveProxyPathPrefix()` — Gemini/Google providers keep `/v1beta` so requests reach `handle_gemini_generate_content`; OpenAI-compatible providers stay on `/v1`. Includes routing regression tests that assert generateContent URLs match the Gemini handler path.
 - **Later commits** `Tool-call preservation, hybrid compaction, assemble tuning`
-  - Preserve image/structured tool results through `convert.ts`; set OpenAI `tool.name`; gate CCR hints; `assembleCompressConfig` / `skipAssembleWhenGatewayRouted`; safer durable hygiene defaults. See `docs/tool-call-preservation.md` and `docs/PR_OVERVIEW.md`.
+  - Tool payload preservation in `convert.ts`: non-text blocks (images, tool envelopes, thinking) never go to the proxy — a short placeholder does — and are restored from the locally held originals (`openAIToAgent(compressed, { originals })`, matched by `tool_call_id` / position). No dependency on the proxy echoing `_headroomMeta`. Set OpenAI `tool.name`; gate CCR hints on real `ccrHashes`; `assembleCompressConfig`; provider-aware `skipAssembleWhenGatewayRouted`; per-image token estimate; safer durable hygiene defaults (`protect_recent: 2`, skip rewrite of protected payloads). See `docs/tool-call-preservation.md` and `docs/PR_OVERVIEW.md`.
 
 ## Testing
 
@@ -96,8 +96,8 @@ Thanks for the detailed review on `656ea3f`. Both blockers are addressed in the 
 
 ```
 $ npm test
- Test Files  16 passed (16)
-      Tests  220+ passed
+ Test Files  19 passed (19)
+      Tests  261 passed (261)
 $ npm run typecheck   # clean
 $ npm run build       # dist ~76 KB
 $ npm run test:stress # native-tool mock stress
