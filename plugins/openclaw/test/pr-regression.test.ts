@@ -131,28 +131,39 @@ describe("PR pillar 4 — assemble behavior", () => {
 });
 
 describe("PR pillar 5 — tool-call preservation vs stock convert", () => {
-  it("view_image emits tool.name and structured image prefix for proxy", () => {
-    const scenario = NATIVE_TOOL_SCENARIOS.find(
-      (s) => s.toolName === "view_image" && s.payloadKind === "image",
-    )!;
-    const openai = agentToOpenAI(buildToolScenarioTranscript(scenario, 0));
+  const imageScenario = NATIVE_TOOL_SCENARIOS.find(
+    (s) => s.toolName === "view_image" && s.payloadKind === "image",
+  )!;
+
+  it("view_image emits tool.name and a placeholder — image bytes never reach the proxy", () => {
+    const transcript = buildToolScenarioTranscript(imageScenario, 0);
+    const openai = agentToOpenAI(transcript);
     const tool = openai.find((m) => m.role === "tool" && m.name === "view_image");
-    expect(tool?.content).toContain("__HR_TOOL_BLOCKS__");
+    expect(tool?.content).toContain("[headroom-omitted image image/png");
+    expect(JSON.stringify(openai)).not.toContain(Buffer.from("fake-png-bytes-0").toString("base64"));
   });
 
-  it("lossy proxy text still restores image bytes from metadata", () => {
-    const scenario = NATIVE_TOOL_SCENARIOS.find(
-      (s) => s.toolName === "view_image" && s.payloadKind === "image",
-    )!;
-    const openai = agentToOpenAI(buildToolScenarioTranscript(scenario, 0));
-    const crushed = openai.map((m) =>
+  it("lossy proxy text with _headroomMeta stripped still restores image bytes from originals", () => {
+    const transcript = buildToolScenarioTranscript(imageScenario, 0);
+    const openai = agentToOpenAI(transcript);
+    const crushed = openai.map(({ _headroomMeta: _dropped, ...m }) =>
       m.role === "tool" ? { ...m, content: "[lossy]" } : m,
     );
-    const restored = openAIToAgent(crushed);
+    const restored = openAIToAgent(crushed, { originals: transcript });
     const view = restored.find((m) => m.role === "toolResult" && m.toolName === "view_image");
-    const hasImage = Array.isArray(view?.content) &&
-      view.content.some((b: { type?: string }) => b.type === "image");
-    expect(hasImage).toBe(true);
+    const image = Array.isArray(view?.content)
+      ? view.content.find((b: { type?: string }) => b.type === "image")
+      : undefined;
+    expect(image?.data).toBe(Buffer.from("fake-png-bytes-0").toString("base64"));
+  });
+
+  it("stock-style restore without originals degrades to text only (documents why originals matter)", () => {
+    const transcript = buildToolScenarioTranscript(imageScenario, 0);
+    const crushed = agentToOpenAI(transcript).map(({ _headroomMeta: _dropped, ...m }) =>
+      m.role === "tool" ? { ...m, content: "[lossy]" } : m,
+    );
+    const view = openAIToAgent(crushed).find((m) => m.toolName === "view_image");
+    expect(view?.content).toEqual([{ type: "text", text: "[lossy]" }]);
   });
 
   it("infers isError from JSON error envelope when meta stripped", () => {

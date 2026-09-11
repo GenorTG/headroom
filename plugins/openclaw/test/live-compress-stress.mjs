@@ -183,7 +183,7 @@ async function compressTranscript(label, transcript) {
   }
 
   const data = await response.json();
-  const restored = openAIToAgent(data.messages);
+  const restored = openAIToAgent(data.messages, { originals: transcript });
   const before = summarizeToolResults(transcript);
   const after = summarizeToolResults(restored);
 

@@ -249,7 +249,7 @@ Compression is lossless via CCR (Compress-Cache-Retrieve): originals are stored 
 | `transcriptProjectionWaitMs` | `120000` | Max wait after hygiene rewrites for OpenClaw transcript projection rebuild to settle. `0` disables waiting. |
 | `transcriptHygiene.debounceMs` | `30000` | Per-session debounce window for turn-end hygiene and hybrid compact pre-passes. Prevents stacked SQLite rewrites within seconds. |
 | `assembleCompressConfig` | `{ protect_recent: 2 }` | Per-turn `/v1/compress` config for `assemble()`. Default protects the last two messages from aggressive inline compression. |
-| `skipAssembleWhenGatewayRouted` | `false` | When `true` and `gatewayProviderIds` is set, skip `assemble()` compression because live provider requests already pass through the Headroom proxy (prevents double compression). |
+| `skipAssembleWhenGatewayRouted` | `false` | When `true`, skip `assemble()` compression for models whose provider is in `gatewayProviderIds` (their live requests already pass through the proxy — prevents double compression). Providers that are not routed still get `assemble()` compression. If the provider is unknown the skip applies. |
 
 ### Proxy env mitigations (operator config)
 
@@ -283,13 +283,13 @@ No Headroom Python source edits are required — these are documented operator m
 
 OpenClaw agents can lose tool payloads (especially `view_image`, `browser`, multimodal tool results) when messages pass through `assemble()` conversion. The plugin now:
 
-- Preserves image and structured tool results through `agentToOpenAI` / `openAIToAgent` round-trips
+- Keeps non-text blocks (images, tool envelopes, thinking) **off the wire**: the proxy sees only text plus a short `[headroom-omitted image image/png N bytes]` placeholder, so base64 is never tokenized or compressed
+- Restores images, tool call blocks, thinking blocks, `toolName`, `isError` and timestamps from the **locally held originals** after compression (`openAIToAgent(compressed, { originals })`) — tool results are matched by `tool_call_id`, other messages by position. Restoration does not depend on the proxy echoing `_headroomMeta`
 - Sets OpenAI `tool.name` from `toolName` so proxy protect/exclude lists can match OpenClaw tools
-- Preserves assistant thinking/toolCall blocks via metadata
 - Gates misleading `headroom_retrieve` hints on actual CCR hashes
 - Passes `protect_recent: 2` to per-turn and durable compress requests by default
 - Skips durable rewrite of messages with protected tool/image payloads
-- Optional: `skipAssembleWhenGatewayRouted: true` to avoid double compression when `gatewayProviderIds` is set
+- Optional: `skipAssembleWhenGatewayRouted: true` skips per-turn compression only for the provider actually routed through the proxy (`runtimeSettings.model.provider` ∈ `gatewayProviderIds`); direct providers keep compressing
 
 Full investigation, reproduction steps, and staging checklist: **[docs/tool-call-preservation.md](./docs/tool-call-preservation.md)**
 

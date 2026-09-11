@@ -204,15 +204,18 @@ const roundTrip = openAIToAgent(agentToOpenAI(messages));
 
 ## Fix plan (plugin only)
 
-### Phase 1 — `convert.ts` (this PR)
+### Phase 1 — `convert.ts` ✅
 
 | Task | Description |
 |------|-------------|
-| **1a** | Preserve full toolResult content in `agentToOpenAI`: serialize block arrays faithfully (text + image + nested), not `extractText()` only |
-| **1b** | Set `name` on OpenAI `tool` messages from `toolName` / meta |
-| **1c** | Restore image and block arrays in `openAIToAgent` tool branch |
-| **1d** | Change `normalizeAssistantContent` to passthrough unknown blocks (or fail loud in debug) instead of `[]` |
-| **1e** | Extend `extractText()` only for intentional plain-text fallback paths, not toolResult conversion |
+| **1a** | Non-text blocks never reach the proxy. `agentToOpenAI` emits text verbatim and a short `[headroom-omitted <type> …]` placeholder per image/tool envelope (`content-blocks.ts`). Base64 is neither tokenized, counted in `tokens_before`, nor eligible for lossy rewrite |
+| **1b** | Set `name` on OpenAI `tool` messages from `toolName` |
+| **1c** | `openAIToAgent(compressed, { originals })` restores images, `toolCall` / `thinking` / unknown blocks, `toolName`, `toolCallId`, `isError`, timestamps and assistant metadata from the **local originals** (`original-lookup.ts`): tool messages by unique `tool_call_id`, others by echoed `hrIndex` hint or position. Compressed text is folded into the first text block; non-text blocks keep their position (`mergeCompressedTextIntoBlocks`) |
+| **1d** | `normalizeAssistantContent` passes unknown blocks through instead of dropping them |
+| **1e** | Without originals (stock-compatible call), behaviour degrades to text-only — documented and test-locked |
+| **1f** | `estimateRoughTokens` charges a fixed ~1.5k tokens per image (vision pricing) instead of `base64.length / 4`, so image-heavy sessions do not trip the budget short-circuit on every turn |
+
+Design note: an earlier iteration of this branch carried block arrays inside a `__HR_TOOL_BLOCKS__` content prefix and in `_headroomMeta`. That shipped every image **twice** as base64 text to the proxy (a 60 KB image inflated `tokens_before` from ~10k to ~50k in a live probe) and relied on the proxy echoing `_headroomMeta`, which it does not do consistently (observed `isError` loss in the mega-80 live run). Both problems are removed by the originals-based restore.
 
 ### Phase 2 — `engine.ts` ✅
 
@@ -220,7 +223,8 @@ const roundTrip = openAIToAgent(agentToOpenAI(messages));
 |------|-------------|
 | **2a** | Gate `systemPromptAddition` on `result.ccrHashes?.length > 0` (or equivalent SDK field) |
 | **2b** | Pass `assembleCompressConfig` (default `protect_recent: 2`) to `compress()` via headroom-ai SDK |
-| **2c** | `skipAssembleWhenGatewayRouted` config flag (default `false`) skips assemble when `gatewayProviderIds` is set |
+| **2c** | `skipAssembleWhenGatewayRouted` (default `false`) skips assemble **only when `runtimeSettings.model.provider` is gateway-routed** (`assemble-skip.ts`). Non-routed providers still compress; unknown provider → skip (honours operator intent) |
+| **2d** | `assemble()` calls `openAIToAgent(result.messages, { originals: params.messages })` |
 
 ### Phase 3 — `compaction.ts` ✅
 
@@ -242,12 +246,16 @@ const roundTrip = openAIToAgent(agentToOpenAI(messages));
 
 ## Testing plan
 
-### Unit tests (`test/convert.test.ts`)
+### Unit tests (`test/convert.test.ts`, `test/content-blocks.test.ts`, `test/original-lookup.test.ts`, `test/assemble-skip.test.ts`)
 
-- [x] Image toolResult round-trip preserves `{ type: "image" }`
+- [x] Image bytes never appear in the `agentToOpenAI` output (placeholder only)
+- [x] Image toolResult round-trip preserves `{ type: "image" }` with `_headroomMeta` echoed **and** stripped
 - [x] Tool message includes `name: "view_image"` / `"browser"`
-- [x] Mixed assistant content: text + toolCall + thinking preserved
-- [x] Unknown block type passthrough (or explicit snapshot of allowed behavior)
+- [x] Mixed assistant content: text + toolCall + thinking preserved; multi-text assistants do not duplicate text
+- [x] Tool results restored by `tool_call_id` when the proxy dropped other messages
+- [x] `isError` restored from originals; fallback heuristic only fires on the OpenClaw envelope (`status` + `tool`)
+- [x] Unknown block type passthrough
+- [x] Provider-aware gateway skip (routed / not routed / unknown)
 - [x] Regression: existing text toolResult tests still pass
 
 ### Engine tests (`test/engine.test.ts`)
@@ -267,7 +275,8 @@ const roundTrip = openAIToAgent(agentToOpenAI(messages));
 1. Godot or Finetune session: `browser` screenshot → `view_image` → model describes image correctly after 500k+ context.
 2. Proxy log: `/v1/compress` request bodies include `tool.name` for OpenClaw tools and `config.protect_recent: 2`.
 3. No `headroom_retrieve` spiral when compress saves tokens without hashes.
-4. With `gatewayProviderIds` enabled, set `skipAssembleWhenGatewayRouted: true` and confirm single compression path on live provider requests.
+4. With `gatewayProviderIds` enabled, set `skipAssembleWhenGatewayRouted: true` and confirm single compression path on live provider requests for routed providers, while a direct provider still logs `Assembled: … tokens`.
+5. Proxy log: `/v1/compress` request bodies for `view_image` turns are a few hundred bytes (placeholder), not the image size.
 
 ### Suggested staging `openclaw.json` (after plugin reload)
 

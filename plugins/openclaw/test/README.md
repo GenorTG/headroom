@@ -15,7 +15,10 @@
 | Path | Scope |
 |------|-------|
 | `pr-regression.test.ts` | **Start here** — one block per PR pillar vs stock `main` |
-| `convert.test.ts` | Message conversion & tool-call preservation |
+| `convert.test.ts` | Message conversion & tool-call preservation (wire format, originals-based restore) |
+| `content-blocks.test.ts` | Wire placeholders, text/block merge, protected-payload detection |
+| `original-lookup.test.ts` | Matching compressed messages back to originals |
+| `assemble-skip.test.ts` | Provider-aware `skipAssembleWhenGatewayRouted` |
 | `engine.test.ts` | Assemble, compact, circuit breaker, CCR hints |
 | `compaction*.test.ts` | Durable SQLite compaction modes |
 | `gateway-config.test.ts` | Multi-upstream routing |

@@ -10,11 +10,43 @@
  *   content: string
  *   tool_calls?: ToolCall[]
  *   tool_call_id?: string
+ *
+ * Non-text blocks (images, tool envelopes) are never sent to the proxy. They are
+ * replaced by placeholders on the wire and restored from the original messages
+ * by `openAIToAgent(..., { originals })`. `_headroomMeta` is still attached as a
+ * best-effort hint, but restoration does not depend on the proxy echoing it.
  */
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
-/** Rough token estimate (~4 chars/token) for assemble budget short-circuit. */
+import {
+  type ContentBlock,
+  IMAGE_TOKEN_ESTIMATE,
+  isImageBlock,
+  isRecord,
+  isTextBlock,
+  mergeCompressedTextIntoBlocks,
+  serializeAssistantTextForWire,
+  serializeBlocksForWire,
+} from "./content-blocks.js";
+import { buildOriginalLookup, findOriginal } from "./original-lookup.js";
+
+/** Joiner for text blocks inside tool results and user messages on the wire. */
+const BLOCK_JOINER = "\n";
+
+/** Keys that exist only for the wire round-trip and must not leak into AgentMessages. */
+const INTERNAL_META_KEYS = new Set(["hrIndex"]);
+
+const DEFAULT_USAGE = {
+  input: 0,
+  output: 0,
+  cacheRead: 0,
+  cacheWrite: 0,
+  totalTokens: 0,
+  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+};
+
+/** Rough token estimate (~4 chars/token, fixed cost per image) for assemble budget short-circuit. */
 export function estimateRoughTokens(messages: any[]): number {
   let chars = 0;
   for (const msg of messages) {
@@ -25,8 +57,10 @@ export function estimateRoughTokens(messages: any[]): number {
     }
     if (Array.isArray(content)) {
       for (const block of content) {
-        if (block?.type === "text" && typeof block.text === "string") {
+        if (isTextBlock(block)) {
           chars += block.text.length;
+        } else if (isImageBlock(block)) {
+          chars += IMAGE_TOKEN_ESTIMATE * 4;
         } else {
           chars += JSON.stringify(block).length;
         }
@@ -49,121 +83,13 @@ export interface OpenAIMessage {
   _headroomMeta?: Record<string, unknown>;
 }
 
-/** Prefix for structured toolResult block arrays in OpenAI tool message content. */
-export const TOOL_CONTENT_BLOCKS_PREFIX = "__HR_TOOL_BLOCKS__";
-
-/** Prefix for structured user content block arrays in OpenAI user message content. */
-export const USER_CONTENT_BLOCKS_PREFIX = "__HR_USER_BLOCKS__";
-
-/** True when a message carries multimodal or tool payloads that must not be lossy-rewritten. */
-function blockIsProtectedPayload(block: unknown): boolean {
-  if (!isRecord(block) || typeof block.type !== "string") return false;
-  return (
-    block.type === "image" ||
-    block.type === "toolCall" ||
-    block.type === "tool_use" ||
-    block.type === "tool_result"
-  );
-}
-
-export function messageHasProtectedToolPayload(message: any): boolean {
-  if (!isRecord(message)) return false;
-  const role = message.role;
-  if (
-    role !== "toolResult" &&
-    role !== "tool_result" &&
-    role !== "assistant" &&
-    role !== "user"
-  ) {
-    return false;
-  }
-  const content = message.content;
-  if (!Array.isArray(content)) return false;
-  return content.some((block) => blockIsProtectedPayload(block));
-}
-
-/** Serialize normalized toolResult blocks for OpenAI tool role (string content only). */
-export function serializeToolResultBlocks(blocks: any[]): string {
-  if (blocks.length === 0) return "";
-  if (blocks.length === 1 && blocks[0]?.type === "text" && typeof blocks[0].text === "string") {
-    return blocks[0].text;
-  }
-  const textOnly = blocks.every(
-    (block) => block?.type === "text" && typeof block.text === "string",
-  );
-  if (textOnly) {
-    return blocks.map((block) => block.text).join("\n");
-  }
-  return `${TOOL_CONTENT_BLOCKS_PREFIX}${JSON.stringify(blocks)}`;
-}
-
-/** Restore block arrays from OpenAI string content and preserved metadata. */
-export function deserializeStructuredContent(
-  content: string | null | undefined,
-  meta: Record<string, unknown>,
-  options: {
-    prefix: string;
-    metaKey: "toolContentBlocks" | "userContentBlocks";
-  },
-): any[] {
-  const trimmed = typeof content === "string" ? content : "";
-  if (trimmed.startsWith(options.prefix)) {
-    try {
-      const parsed = JSON.parse(trimmed.slice(options.prefix.length));
-      if (Array.isArray(parsed) && parsed.length > 0) return parsed;
-    } catch {
-      // fall through to meta / plain text
-    }
-  }
-
-  const fromMeta = meta[options.metaKey];
-  if (Array.isArray(fromMeta) && fromMeta.length > 0) {
-    const metaHasStructured = fromMeta.some(
-      (block) => isRecord(block) && block.type !== "text",
-    );
-    if (metaHasStructured || !trimmed) {
-      return fromMeta;
-    }
-  }
-
-  return [{ type: "text", text: trimmed }];
-}
-
-/** Restore toolResult blocks from OpenAI tool content and preserved metadata. */
-export function deserializeToolResultContent(
-  content: string | null | undefined,
-  meta: Record<string, unknown>,
-): any[] {
-  return deserializeStructuredContent(content, meta, {
-    prefix: TOOL_CONTENT_BLOCKS_PREFIX,
-    metaKey: "toolContentBlocks",
-  });
-}
-
-/** Restore user content blocks from OpenAI user content and preserved metadata. */
-export function deserializeUserContent(
-  content: string | null | undefined,
-  meta: Record<string, unknown>,
-): any[] {
-  return deserializeStructuredContent(content, meta, {
-    prefix: USER_CONTENT_BLOCKS_PREFIX,
-    metaKey: "userContentBlocks",
-  });
-}
-
-/** Serialize normalized user content blocks for OpenAI user role (string content only). */
-export function serializeUserContentBlocks(blocks: any[]): string {
-  if (blocks.length === 0) return "";
-  if (blocks.length === 1 && blocks[0]?.type === "text" && typeof blocks[0].text === "string") {
-    return blocks[0].text;
-  }
-  const textOnly = blocks.every(
-    (block) => block?.type === "text" && typeof block.text === "string",
-  );
-  if (textOnly) {
-    return blocks.map((block) => block.text).join("\n");
-  }
-  return `${USER_CONTENT_BLOCKS_PREFIX}${JSON.stringify(blocks)}`;
+export interface OpenAIToAgentOptions {
+  /**
+   * The AgentMessages that were passed to `agentToOpenAI`. When provided, image
+   * blocks, tool call blocks, thinking blocks, `isError`, `toolName` and other
+   * metadata are restored from these instead of from proxy-echoed metadata.
+   */
+  originals?: any[];
 }
 
 /**
@@ -172,7 +98,7 @@ export function serializeUserContentBlocks(blocks: any[]): string {
 export function agentToOpenAI(messages: any[]): OpenAIMessage[] {
   const result: OpenAIMessage[] = [];
 
-  for (const msg of messages) {
+  messages.forEach((msg, index) => {
     const normalized = normalizeAgentMessage(msg);
     const role = normalized.role;
 
@@ -180,6 +106,7 @@ export function agentToOpenAI(messages: any[]): OpenAIMessage[] {
       const meta = { ...normalized } as Record<string, unknown>;
       delete meta.role;
       delete meta.content;
+      meta.hrIndex = index;
       return meta;
     };
 
@@ -192,32 +119,23 @@ export function agentToOpenAI(messages: any[]): OpenAIMessage[] {
             : extractText(normalized.content),
         _headroomMeta: buildMeta(),
       });
-      continue;
+      return;
     }
 
     if (role === "user") {
       const content = normalized.content;
       if (typeof content === "string") {
-        result.push({
-          role: "user",
-          content,
-          _headroomMeta: buildMeta(),
-        });
-        continue;
+        result.push({ role: "user", content, _headroomMeta: buildMeta() });
+        return;
       }
 
       if (Array.isArray(content)) {
-        const userBlocks = normalizeUserContent(content);
-        const meta = {
-          ...buildMeta(),
-          userContentBlocks: userBlocks,
-        };
         result.push({
           role: "user",
-          content: serializeUserContentBlocks(userBlocks),
-          _headroomMeta: meta,
+          content: serializeBlocksForWire(normalizeUserContent(content), BLOCK_JOINER),
+          _headroomMeta: buildMeta(),
         });
-        continue;
+        return;
       }
 
       result.push({
@@ -225,96 +143,63 @@ export function agentToOpenAI(messages: any[]): OpenAIMessage[] {
         content: JSON.stringify(content),
         _headroomMeta: buildMeta(),
       });
-      continue;
+      return;
     }
 
     if (role === "assistant") {
       const content = normalized.content;
       if (typeof content === "string") {
         result.push({ role: "assistant", content, _headroomMeta: buildMeta() });
-        continue;
+        return;
       }
 
-      // Content blocks: extract text and tool call blocks.
-      // OpenClaw uses `toolCall`; some adapters still emit legacy `tool_use`.
+      // Content blocks: text goes on the wire, tool calls become `tool_calls`,
+      // thinking and unknown blocks stay local and are restored from originals.
       if (Array.isArray(content)) {
-        const normalizedBlocks = normalizeAssistantContent(content);
-        const textParts: string[] = [];
+        const blocks = normalizeAssistantContent(content);
+        const wireTextValue = serializeAssistantTextForWire(blocks);
         const toolCalls: any[] = [];
-        const preservedBlocks: any[] = [];
 
-        for (const block of normalizedBlocks) {
-          if (typeof block === "string") {
-            textParts.push(block);
-            preservedBlocks.push({ type: "text", text: block });
-          } else if (block.type === "text" && typeof block.text === "string") {
-            textParts.push(block.text);
-            preservedBlocks.push(block);
-          } else if (block.type === "tool_use" || block.type === "toolCall") {
-            const args =
-              block.type === "toolCall"
-                ? block.arguments
-                : block.input;
+        for (const block of blocks) {
+          if (block.type === "toolCall") {
+            const args = block.arguments;
             toolCalls.push({
               id: block.id,
               type: "function",
               function: {
                 name: block.name,
-                arguments:
-                  typeof args === "string"
-                    ? args
-                    : JSON.stringify(args ?? {}),
+                arguments: typeof args === "string" ? args : JSON.stringify(args ?? {}),
               },
             });
-            preservedBlocks.push(block);
-          } else {
-            preservedBlocks.push(block);
           }
         }
 
         const openaiMsg: OpenAIMessage = {
           role: "assistant",
-          content: textParts.length > 0 ? textParts.join("") : null,
-          _headroomMeta: {
-            ...buildMeta(),
-            assistantContentBlocks: preservedBlocks,
-          },
+          content: wireTextValue.length > 0 ? wireTextValue : null,
+          _headroomMeta: buildMeta(),
         };
         if (toolCalls.length > 0) {
           openaiMsg.tool_calls = toolCalls;
         }
         result.push(openaiMsg);
       }
-      continue;
+      return;
     }
 
     if (role === "toolResult" || role === "tool_result") {
-      const toolBlocks =
-        typeof normalized.content === "string"
-          ? [{ type: "text", text: normalized.content }]
-          : Array.isArray(normalized.content)
-            ? normalizeToolResultContent(normalized.content)
-            : [{ type: "text", text: JSON.stringify(normalized.content) }];
+      const toolBlocks = normalizeToolResultContent(normalized.content);
       const toolName =
         typeof normalized.toolName === "string" ? normalized.toolName : undefined;
-      const meta = {
-        ...buildMeta(),
-        toolContentBlocks: toolBlocks,
-        ...(toolName ? { toolName } : {}),
-      };
 
       result.push({
         role: "tool",
-        content: serializeToolResultBlocks(toolBlocks),
-        tool_call_id:
-          normalized.toolCallId ??
-          normalized.tool_use_id ??
-          normalized.id ??
-          "unknown",
+        content: serializeBlocksForWire(toolBlocks, BLOCK_JOINER),
+        tool_call_id: normalized.toolCallId ?? "unknown",
         ...(toolName ? { name: toolName } : {}),
-        _headroomMeta: meta,
+        _headroomMeta: buildMeta(),
       });
-      continue;
+      return;
     }
 
     // Fallback: pass through as user message
@@ -326,143 +211,170 @@ export function agentToOpenAI(messages: any[]): OpenAIMessage[] {
           : JSON.stringify(normalized.content),
       _headroomMeta: buildMeta(),
     });
-  }
+  });
 
   return result;
 }
 
 /**
  * Convert compressed OpenAI messages back to AgentMessage format.
+ *
+ * Pass `options.originals` (the input to `agentToOpenAI`) to restore images, tool
+ * call blocks, thinking blocks and metadata regardless of what the proxy echoed.
  */
-export function openAIToAgent(messages: OpenAIMessage[]): any[] {
+export function openAIToAgent(
+  messages: OpenAIMessage[],
+  options: OpenAIToAgentOptions = {},
+): any[] {
+  const lookup = options.originals
+    ? buildOriginalLookup(normalizeAgentMessages(options.originals))
+    : null;
   const result: any[] = [];
 
-  for (const msg of messages) {
-    const meta = (msg._headroomMeta ?? {}) as Record<string, unknown>;
-    const timestamp =
-      typeof meta.timestamp === "number" ? meta.timestamp : Date.now();
+  messages.forEach((msg, index) => {
+    const meta = stripInternalMeta(msg._headroomMeta);
+    const original = lookup
+      ? findOriginal({ compressed: msg, index, compressedCount: messages.length, lookup })
+      : null;
+    // Original fields win over echoed metadata; both are already normalized.
+    const base: Record<string, unknown> = original ? { ...original } : { ...meta };
+    delete base.role;
+    delete base.content;
+    const timestamp = typeof base.timestamp === "number" ? base.timestamp : Date.now();
 
     if (msg.role === "system") {
-      result.push({
-        role: "system",
-        content: msg.content ?? "",
-        timestamp,
-      });
-      continue;
+      result.push({ role: "system", content: msg.content ?? "", timestamp });
+      return;
     }
 
     if (msg.role === "user") {
-      const blocks = deserializeUserContent(msg.content, meta);
-      const content =
-        blocks.length === 1 && blocks[0]?.type === "text" && typeof blocks[0].text === "string"
-          ? blocks[0].text
-          : blocks;
       result.push({
-        ...(meta as object),
+        ...base,
         role: "user",
-        content,
+        content: restoreUserContent(msg, original),
         timestamp,
       });
-      continue;
+      return;
     }
 
     if (msg.role === "assistant") {
-      const preserved = Array.isArray(meta.assistantContentBlocks)
-        ? (meta.assistantContentBlocks as any[])
-        : null;
-      const blocks: any[] = preserved ? [...preserved] : [];
-
-      if (!preserved) {
-        if (msg.content) {
-          blocks.push({ type: "text", text: msg.content });
-        }
-        if (msg.tool_calls) {
-          for (const tc of msg.tool_calls) {
-            let input: any;
-            try {
-              input = JSON.parse(tc.function.arguments);
-            } catch {
-              input = tc.function.arguments ?? {};
-            }
-            blocks.push({
-              type: "toolCall",
-              id: tc.id,
-              name: tc.function.name,
-              arguments: input,
-            });
-          }
-        }
-      } else if (msg.content) {
-        const textIndex = blocks.findIndex((block) => block?.type === "text");
-        if (textIndex >= 0) {
-          blocks[textIndex] = { type: "text", text: msg.content };
-        } else {
-          blocks.unshift({ type: "text", text: msg.content });
-        }
-      }
       // OpenClaw's Pi agent expects content to always be an array for assistant messages
       // (it calls .flatMap() on it). Never flatten to a string.
       result.push({
-        ...(meta as object),
+        ...base,
         role: "assistant",
-        content: blocks,
-        api: typeof meta.api === "string" ? meta.api : "headroom",
-        provider: typeof meta.provider === "string" ? meta.provider : "headroom",
-        model: typeof meta.model === "string" ? meta.model : "headroom",
-        usage:
-          isRecord(meta.usage)
-            ? meta.usage
-            : {
-                input: 0,
-                output: 0,
-                cacheRead: 0,
-                cacheWrite: 0,
-                totalTokens: 0,
-                cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-              },
-        stopReason:
-          typeof meta.stopReason === "string" ? meta.stopReason : "stop",
+        content: restoreAssistantContent(msg, original),
+        api: typeof base.api === "string" ? base.api : "headroom",
+        provider: typeof base.provider === "string" ? base.provider : "headroom",
+        model: typeof base.model === "string" ? base.model : "headroom",
+        usage: isRecord(base.usage) ? base.usage : DEFAULT_USAGE,
+        stopReason: typeof base.stopReason === "string" ? base.stopReason : "stop",
         timestamp,
       });
-      continue;
+      return;
     }
 
     if (msg.role === "tool") {
-      const rawContent =
-        typeof msg.content === "string"
-          ? msg.content
-          : msg.content == null
-            ? ""
-            : JSON.stringify(msg.content);
-      const toolCallId = msg.tool_call_id ?? "unknown";
-      const toolName =
-        typeof msg.name === "string"
-          ? msg.name
-          : typeof meta.toolName === "string"
-            ? meta.toolName
-            : "headroom";
-      const content = deserializeToolResultContent(rawContent, meta);
+      const wireCallId = msg.tool_call_id ?? "unknown";
+      const toolCallId = typeof base.toolCallId === "string" ? base.toolCallId : wireCallId;
+      const content = restoreToolResultContent(msg, original);
       result.push({
-        ...(meta as object),
+        ...base,
         role: "toolResult",
         content,
-        toolCallId:
-          typeof meta.toolCallId === "string" ? meta.toolCallId : toolCallId,
-        tool_use_id:
-          typeof meta.tool_use_id === "string" ? meta.tool_use_id : toolCallId,
-        toolName,
-        isError: inferToolResultIsError(content, meta),
+        toolCallId,
+        tool_use_id: typeof base.tool_use_id === "string" ? base.tool_use_id : toolCallId,
+        toolName:
+          typeof base.toolName === "string"
+            ? base.toolName
+            : typeof msg.name === "string"
+              ? msg.name
+              : "headroom",
+        isError: inferToolResultIsError(content, base),
         timestamp,
       });
-      continue;
     }
-  }
+  });
 
   return result;
 }
 
 export function normalizeAgentMessages(messages: any[]): any[] {
   return messages.map((message) => normalizeAgentMessage(message));
+}
+
+function stripInternalMeta(meta: Record<string, unknown> | undefined): Record<string, unknown> {
+  if (!isRecord(meta)) return {};
+  const cleaned: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(meta)) {
+    if (!INTERNAL_META_KEYS.has(key)) cleaned[key] = value;
+  }
+  return cleaned;
+}
+
+function wireText(msg: OpenAIMessage): string {
+  if (typeof msg.content === "string") return msg.content;
+  if (msg.content == null) return "";
+  return JSON.stringify(msg.content);
+}
+
+function restoreUserContent(
+  msg: OpenAIMessage,
+  original: Record<string, unknown> | null,
+): string | ContentBlock[] {
+  const text = wireText(msg);
+  if (!original || !Array.isArray(original.content)) return text;
+  const originalBlocks = normalizeUserContent(original.content);
+  return mergeCompressedTextIntoBlocks({
+    originalBlocks,
+    originalWireText: serializeBlocksForWire(originalBlocks, BLOCK_JOINER),
+    compressedText: text,
+  });
+}
+
+function restoreAssistantContent(
+  msg: OpenAIMessage,
+  original: Record<string, unknown> | null,
+): ContentBlock[] {
+  if (original && Array.isArray(original.content)) {
+    const originalBlocks = normalizeAssistantContent(original.content);
+    return mergeCompressedTextIntoBlocks({
+      originalBlocks,
+      originalWireText: serializeAssistantTextForWire(originalBlocks),
+      compressedText: wireText(msg),
+    });
+  }
+
+  const blocks: ContentBlock[] = [];
+  if (msg.content) {
+    blocks.push({ type: "text", text: msg.content });
+  }
+  for (const tc of msg.tool_calls ?? []) {
+    let input: unknown;
+    try {
+      input = JSON.parse(tc.function.arguments);
+    } catch {
+      input = tc.function.arguments ?? {};
+    }
+    blocks.push({ type: "toolCall", id: tc.id, name: tc.function.name, arguments: input });
+  }
+  return blocks;
+}
+
+function restoreToolResultContent(
+  msg: OpenAIMessage,
+  original: Record<string, unknown> | null,
+): ContentBlock[] {
+  const text = wireText(msg);
+  if (original) {
+    const originalBlocks = normalizeToolResultContent(original.content);
+    return mergeCompressedTextIntoBlocks({
+      originalBlocks,
+      originalWireText: serializeBlocksForWire(originalBlocks, BLOCK_JOINER),
+      compressedText: text,
+    });
+  }
+  return [{ type: "text", text }];
 }
 
 /**
@@ -500,31 +412,19 @@ function normalizeAgentMessage(message: any): any {
 }
 
 function normalizeAssistantMessage(message: Record<string, any>): Record<string, any> {
-  const normalizedContent = normalizeAssistantContent(message.content);
-
   return {
     ...message,
-    content: normalizedContent,
+    content: normalizeAssistantContent(message.content),
     api: typeof message.api === "string" ? message.api : "headroom",
     provider: typeof message.provider === "string" ? message.provider : "headroom",
     model: typeof message.model === "string" ? message.model : "headroom",
-    usage: isRecord(message.usage)
-      ? message.usage
-      : {
-          input: 0,
-          output: 0,
-          cacheRead: 0,
-          cacheWrite: 0,
-          totalTokens: 0,
-          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-        },
+    usage: isRecord(message.usage) ? message.usage : DEFAULT_USAGE,
     stopReason: typeof message.stopReason === "string" ? message.stopReason : "stop",
     timestamp: typeof message.timestamp === "number" ? message.timestamp : Date.now(),
   };
 }
 
 function normalizeToolResultMessage(message: Record<string, any>): Record<string, any> {
-  const normalizedContent = normalizeToolResultContent(message.content);
   const toolCallId =
     typeof message.toolCallId === "string"
       ? message.toolCallId
@@ -537,7 +437,7 @@ function normalizeToolResultMessage(message: Record<string, any>): Record<string
   return {
     ...message,
     role: "toolResult",
-    content: normalizedContent,
+    content: normalizeToolResultContent(message.content),
     toolCallId,
     tool_use_id:
       typeof message.tool_use_id === "string" ? message.tool_use_id : toolCallId,
@@ -547,13 +447,15 @@ function normalizeToolResultMessage(message: Record<string, any>): Record<string
   };
 }
 
-function normalizeAssistantContent(content: unknown): any[] {
+function normalizeAssistantContent(content: unknown): ContentBlock[] {
   if (Array.isArray(content)) {
-    return content.flatMap((block) => {
+    return content.flatMap((block): ContentBlock[] => {
       if (typeof block === "string") return [{ type: "text", text: block }];
       if (!isRecord(block) || typeof block.type !== "string") return [];
-      if (block.type === "text" && typeof block.text === "string") return [block];
-      if (block.type === "thinking" && typeof block.thinking === "string") return [block];
+      if (isTextBlock(block)) return [block];
+      if (block.type === "thinking" && typeof block.thinking === "string") {
+        return [block as ContentBlock];
+      }
       if (
         (block.type === "toolCall" || block.type === "tool_use") &&
         typeof block.name === "string"
@@ -564,15 +466,11 @@ function normalizeAssistantContent(content: unknown): any[] {
             id: typeof block.id === "string" ? block.id : "unknown",
             name: block.name,
             arguments:
-              "arguments" in block
-                ? block.arguments
-                : "input" in block
-                  ? block.input
-                  : {},
+              "arguments" in block ? block.arguments : "input" in block ? block.input : {},
           },
         ];
       }
-      return [block];
+      return [block as ContentBlock];
     });
   }
 
@@ -587,12 +485,12 @@ function normalizeAssistantContent(content: unknown): any[] {
   return [{ type: "text", text: JSON.stringify(content) }];
 }
 
-function normalizeUserContent(content: unknown): any[] {
+function normalizeUserContent(content: unknown): ContentBlock[] {
   if (Array.isArray(content)) {
-    return content.flatMap((block) => {
+    return content.flatMap((block): ContentBlock[] => {
       if (typeof block === "string") return [{ type: "text", text: block }];
       if (!isRecord(block) || typeof block.type !== "string") return [];
-      if (block.type === "text" && typeof block.text === "string") return [block];
+      if (isTextBlock(block)) return [block];
       if (block.type === "tool_result" && "content" in block) {
         return [
           {
@@ -607,7 +505,7 @@ function normalizeUserContent(content: unknown): any[] {
           },
         ];
       }
-      return [block];
+      return [block as ContentBlock];
     });
   }
 
@@ -622,23 +520,17 @@ function normalizeUserContent(content: unknown): any[] {
   return [{ type: "text", text: JSON.stringify(content) }];
 }
 
-function normalizeToolResultContent(content: unknown): any[] {
+function normalizeToolResultContent(content: unknown): ContentBlock[] {
   if (Array.isArray(content)) {
-    return content.flatMap((block) => {
+    return content.flatMap((block): ContentBlock[] => {
       if (typeof block === "string") return [{ type: "text", text: block }];
       if (!isRecord(block) || typeof block.type !== "string") return [];
-      if (block.type === "text" && typeof block.text === "string") return [block];
-      if (
-        block.type === "image" &&
-        typeof block.data === "string" &&
-        typeof block.mimeType === "string"
-      ) {
-        return [block];
-      }
+      if (isTextBlock(block)) return [block];
+      if (isImageBlock(block)) return [block];
       if (block.type === "tool_result" && "content" in block) {
         return normalizeToolResultContent(block.content);
       }
-      return [block];
+      return [block as ContentBlock];
     });
   }
 
@@ -653,27 +545,23 @@ function normalizeToolResultContent(content: unknown): any[] {
   return [{ type: "text", text: JSON.stringify(content) }];
 }
 
-function inferToolResultIsError(
-  blocks: unknown[],
-  meta: Record<string, unknown>,
-): boolean {
-  if (typeof meta.isError === "boolean") return meta.isError;
+/**
+ * `isError` comes from the original message when available. Without it we only
+ * trust the OpenClaw error envelope shape (`{"status":"error","tool":"..."}`) so
+ * that ordinary tool output containing a `status` field is not misclassified.
+ */
+function inferToolResultIsError(blocks: ContentBlock[], base: Record<string, unknown>): boolean {
+  if (typeof base.isError === "boolean") return base.isError;
   for (const block of blocks) {
-    if (!isRecord(block) || block.type !== "text" || typeof block.text !== "string") {
-      continue;
-    }
+    if (!isTextBlock(block)) continue;
     const trimmed = block.text.trim();
     if (!trimmed.startsWith("{")) continue;
     try {
-      const parsed = JSON.parse(trimmed) as { status?: string };
-      if (parsed.status === "error") return true;
+      const parsed = JSON.parse(trimmed) as { status?: unknown; tool?: unknown };
+      if (parsed.status === "error" && typeof parsed.tool === "string") return true;
     } catch {
       // not JSON — ignore
     }
   }
   return false;
-}
-
-function isRecord(value: unknown): value is Record<string, any> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

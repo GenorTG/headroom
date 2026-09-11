@@ -14,9 +14,10 @@ paths or credentials.
 | 4 | Session-gated APIs (e.g. opencode-go) return 400 without a session header | `providerSessionHeaders` injects a stable per-process UUID |
 | 5 | `compact()` / `maintain()` were no-ops despite `ownsCompaction` | Real durable compaction via Headroom `/v1/compress` + SQLite rewrite |
 | 6 | `assemble()` always hit the proxy, even far under token budget | Budget short-circuit (~85% of `tokenBudget`) |
-| 7 | Tool payloads mangled in `convert.ts` (images, tool names, assistant blocks) | Structured serialization + metadata round-trip |
+| 7 | Tool payloads mangled in `convert.ts` (images, tool names, assistant blocks) | Non-text blocks stay local (placeholder on the wire); restored from originals by `tool_call_id` / position — no dependency on proxy echoing metadata |
 | 8 | Misleading `headroom_retrieve` hint without CCR hashes | Hint gated on `ccrHashes.length > 0` |
-| 9 | Double compression when gateway providers route through proxy | Opt-in `skipAssembleWhenGatewayRouted` |
+| 9 | Double compression when gateway providers route through proxy | Opt-in, provider-aware `skipAssembleWhenGatewayRouted` |
+| 11 | Image-heavy sessions over-estimated (`base64.length / 4`) and tripped the budget skip every turn | Fixed ~1.5k token estimate per image |
 | 10 | Durable hygiene used `protect_recent: 0` | Default `protect_recent: 2`; skip rewrite of protected tool/image payloads |
 
 ## File-level diff map (vs `main`)
@@ -26,7 +27,10 @@ paths or credentials.
 | File | Role |
 |------|------|
 | `src/engine.ts` | `assemble()`, `compact()`, `maintain()`, `commitTurn()`; budget skip; CCR hint gating; gateway-routed assemble skip; hybrid/openclaw compaction modes |
-| `src/convert.ts` | AgentMessage ↔ OpenAI conversion; image/tool block preservation; tool `name`; user `tool_result` blocks; `isError` inference |
+| `src/convert.ts` | AgentMessage ↔ OpenAI conversion; tool `name`; `openAIToAgent(..., { originals })` restore; image token estimate |
+| `src/content-blocks.ts` | Block type guards, wire placeholders, `mergeCompressedTextIntoBlocks`, `messageHasProtectedToolPayload` |
+| `src/original-lookup.ts` | Match compressed messages to originals (`tool_call_id`, `hrIndex` hint, position) |
+| `src/assemble-skip.ts` | Provider-aware `skipAssembleWhenGatewayRouted` decision |
 | `src/compaction.ts` | Durable `/v1/compress` planning + SQLite apply; protected-payload skip on replace |
 | `src/compaction-mode.ts` | `persistentCompaction`: `openclaw` (default), `hybrid`, `headroom` |
 | `src/compress-request-config.ts` | Shared assemble + durable compress config defaults (`protect_recent: 2`) |
@@ -60,7 +64,7 @@ paths or credentials.
 
 ### Tests
 
-See [TEST_MATRIX.md](./TEST_MATRIX.md). Summary: **224 vitest cases** across 16 files, plus optional live proxy stress scripts.
+See [TEST_MATRIX.md](./TEST_MATRIX.md). Summary: **261 vitest cases** across 19 files, plus optional live proxy stress scripts.
 
 ## Merge with upstream `main` (2026-09-11) — done
 
