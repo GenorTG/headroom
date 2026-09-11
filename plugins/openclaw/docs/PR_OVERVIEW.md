@@ -62,15 +62,17 @@ paths or credentials.
 
 See [TEST_MATRIX.md](./TEST_MATRIX.md). Summary: **224 vitest cases** across 16 files, plus optional live proxy stress scripts.
 
-## Merge with upstream `main` (2026-09-11)
+## Merge with upstream `main` (2026-09-11) — done
 
-This branch integrates these upstream commits not previously on `pr-prep`:
+Branch `pr-prep` is **current with `origin/main`** (0 commits behind). Integrated upstream:
 
-- `#3521` — dependency security remediation (monorepo-wide)
-- `#3516` — Node 24 for npm release packaging
-- `#3531` — consolidated dependency updates; **`plugins/openclaw/package-lock.json`** bumped
+| Commit | Change |
+|--------|--------|
+| `#3521` | Dependency security remediation (monorepo-wide) |
+| `#3516` | Node 24 for npm release packaging |
+| `#3531` | Consolidated dependency updates; `plugins/openclaw/package-lock.json` |
 
-No upstream changes conflict with plugin source logic; only dependency lockfiles required reconciliation.
+Merge commit: `fc7650a`. No plugin source conflicts — auto-merge on lockfiles only.
 
 ## Default behavior vs opt-in features
 
