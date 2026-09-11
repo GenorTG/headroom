@@ -9,7 +9,7 @@ import {
 import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   TurnAdvancementStore,
@@ -215,13 +215,14 @@ describe("TurnAdvancementStore", () => {
       const build = spawnSync("npm", ["run", "build"], {
         cwd: pluginRoot,
         encoding: "utf8",
+        shell: process.platform === "win32",
       });
       expect(build.status).toBe(0);
     }
 
     const storePath = makeStorePath();
     const childScript = `
-      import { TurnAdvancementStore } from ${JSON.stringify(distModule)};
+      import { TurnAdvancementStore } from ${JSON.stringify(pathToFileURL(distModule).href)};
 
       const store = new TurnAdvancementStore({ storePath: process.env.STORE_PATH });
       const status = store.commit({
@@ -467,29 +468,30 @@ describe("resolveTurnAdvancementStorePath", () => {
     expect(
       resolveTurnAdvancementStorePath({
         sessionTarget: {
-          storePath: "/tmp/agent/sessions/main.sqlite",
+          storePath: join(tmpdir(), "agent", "sessions", "main.sqlite"),
         },
       }),
-    ).toBe("/tmp/agent/sessions/headroom-turn-advancements.json");
+    ).toBe(join(tmpdir(), "agent", "sessions", "headroom-turn-advancements.json"));
   });
 
   it("prefers an explicit override path", () => {
     expect(
       resolveTurnAdvancementStorePath({
-        turnAdvancementStorePath: "/custom/turn-advancements.json",
+        turnAdvancementStorePath: join(tmpdir(), "custom", "turn-advancements.json"),
         sessionTarget: {
-          storePath: "/tmp/agent/sessions/main.sqlite",
+          storePath: join(tmpdir(), "agent", "sessions", "main.sqlite"),
         },
       }),
-    ).toBe("/custom/turn-advancements.json");
+    ).toBe(join(tmpdir(), "custom", "turn-advancements.json"));
   });
 
   it("falls back to OPENCLAW_STATE_DIR when no session target is provided", () => {
     const previous = process.env.OPENCLAW_STATE_DIR;
-    process.env.OPENCLAW_STATE_DIR = "/tmp/openclaw-state";
+    const stateDir = join(tmpdir(), "openclaw-state");
+    process.env.OPENCLAW_STATE_DIR = stateDir;
     try {
       expect(resolveTurnAdvancementStorePath({})).toBe(
-        "/tmp/openclaw-state/headroom-turn-advancements.json",
+        join(stateDir, "headroom-turn-advancements.json"),
       );
     } finally {
       if (previous === undefined) {

@@ -19,6 +19,8 @@ paths or credentials.
 | 9 | Double compression when gateway providers route through proxy | Opt-in, provider-aware `skipAssembleWhenGatewayRouted` |
 | 11 | Image-heavy sessions over-estimated (`base64.length / 4`) and tripped the budget skip every turn | Fixed ~1.5k token estimate per image |
 | 10 | Durable hygiene used `protect_recent: 0` | Default `protect_recent: 2`; skip rewrite of protected tool/image payloads |
+| 12 | Turn-advancement lock used `open(wx)` then wrote the PID; a second writer could read the empty lock, treat it as stale, unlink it and commit concurrently | `store-lock.ts`: owner record published atomically (hard-link publish, `O_EXCL` fallback); a lock is stale only when *old* **and** its owner is provably gone (EPERM = alive); recovery claims via atomic `rename` |
+| 13 | Forced/compress-result truncate kept a raw message suffix — the durable tail could start at an orphan `toolResult` or an assistant continuation | `truncate-boundary.ts`: cut re-aligned to a turn start (OpenClaw's own `isTurnStartMessage` rule), orphan tool results dropped, whole tool groups kept; verified against the real SQLite `SessionManager` |
 
 ## File-level diff map (vs `main`)
 
@@ -35,6 +37,8 @@ paths or credentials.
 | `src/compaction-mode.ts` | `persistentCompaction`: `openclaw` (default), `hybrid`, `headroom` |
 | `src/compress-request-config.ts` | Shared assemble + durable compress config defaults (`protect_recent: 2`) |
 | `src/turn-advancement-store.ts` | Idempotent on-disk turn advancement keyed by `advancementKey` |
+| `src/store-lock.ts` | Cross-process lock: atomic ownership publish, age + liveness staleness, rename-claimed recovery |
+| `src/truncate-boundary.ts` | Turn-boundary selection + orphan `toolResult` removal for durable truncation |
 | `src/gateway-config.ts` | In-memory provider rewrite; `providerUpstreams`; `providerSessionHeaders` |
 | `src/proxy-routing.ts` | `/v1` vs `/v1beta` pathname normalization |
 | `src/session-headers.ts` | Per-provider session UUID generation |
@@ -64,7 +68,7 @@ paths or credentials.
 
 ### Tests
 
-See [TEST_MATRIX.md](./TEST_MATRIX.md). Summary: **261 vitest cases** across 19 files, plus optional live proxy stress scripts.
+See [TEST_MATRIX.md](./TEST_MATRIX.md). Summary: **292 vitest cases** across 21 files, plus optional live proxy stress scripts.
 
 ## Merge with upstream `main` (2026-09-11) — done
 

@@ -4,7 +4,7 @@ Run everything:
 
 ```bash
 cd plugins/openclaw
-npm test                    # 261 vitest cases
+npm test                    # 292 vitest cases
 npm run typecheck
 npm run build
 npm run test:stress         # native-tool mock stress
@@ -18,6 +18,10 @@ npm run test:live-stress    # optional; requires Headroom proxy on :8787
 | `transcriptSemantics` declared | Engine degraded to legacy without it | `test/engine.test.ts`, `test/pr-regression.test.ts` |
 | `commitTurn()` returns `{ status }` | Wrong shape leaves outbox stuck | `test/engine.test.ts` |
 | Turn advancement idempotent | Retry/restart must not duplicate | `test/turn-advancement-store.test.ts` |
+| Failed persist → retry returns `committed` | Key must not be cached on failure | `test/turn-advancement-store.test.ts` |
+| Two instances / two processes preserve all keys | Last-write-wins clobbering | `test/turn-advancement-store.test.ts` |
+| Fresh empty lock is never stolen (two-process boundary) | `open(wx)` window let a second writer unlink a live lock | `test/store-lock.test.ts` |
+| Stale recovery needs age **and** dead owner; EPERM = alive; hard ceiling for PID reuse | Any unreadable lock was treated as stale | `test/store-lock.test.ts` |
 
 ## Pillar 2 — Multi-upstream gateway routing
 
@@ -35,6 +39,8 @@ npm run test:live-stress    # optional; requires Headroom proxy on :8787
 |----------|------------------------|-----------|
 | `compact()` rewrites SQLite | Was instant no-op | `test/compaction.test.ts` |
 | Truncate fallback on noop | Huge sessions stuck | `test/compaction.test.ts` |
+| Truncate starts at a turn boundary; no orphan `toolResult`; whole tool groups | Raw suffix cut mid-turn (41-message reviewer fixture) | `test/compaction.test.ts`, `test/truncate-boundary.test.ts` |
+| Truncate uses `resetLeaf()` and reloaded branch is shorter | `branch(parentId)` retained the prefix | `test/compaction.test.ts` |
 | `persistentCompaction` modes | Only one behavior before | `test/compaction-mode.test.ts` |
 | Hygiene replace-only | N/A on stock | `test/transcript-hygiene.test.ts` |
 | Hygiene debounce | Stacked rewrites | `test/hygiene-debounce.test.ts` |
