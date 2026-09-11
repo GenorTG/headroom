@@ -4,7 +4,7 @@ Run everything:
 
 ```bash
 cd plugins/openclaw
-npm test                    # 295 vitest cases
+npm test                    # 297 vitest cases
 npm run typecheck
 npm run build
 npm run test:stress         # native-tool mock stress
@@ -55,6 +55,7 @@ npm run test:live-stress    # optional; requires Headroom proxy on :8787
 |----------|------------------------|-----------|
 | Budget short-circuit (~85%) | Every turn hit proxy | `test/engine.test.ts` |
 | `assembleCompressConfig` passed to SDK | No per-turn protect_recent | `test/engine.test.ts`, `test/stress/...` |
+| Budget skip threshold `(budget − reserve) × ratio`: 130k/200k compresses by default; reserve models a large system prompt; invalid ratio/reserve clamp to defaults; oversized reserve never disables compression | Headroom never ran before OpenClaw's native compaction on ~200k windows | `test/engine.test.ts` |
 | `skipAssembleWhenGatewayRouted` (provider-aware) | Double compression; blanket skip would disable compression for direct providers | `test/assemble-skip.test.ts`, `test/engine.test.ts`, `test/tool-call-preservation.integration.test.ts` |
 | CCR hint only with hashes | False retrieve spirals | `test/engine.test.ts`, `test/tool-call-preservation.integration.test.ts` |
 

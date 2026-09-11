@@ -51,7 +51,14 @@ vi.mock("../src/proxy-manager.js", () => ({
   defaultLogger: mocked.logger,
 }));
 
-import { HeadroomContextEngine } from "../src/engine.js";
+import {
+  DEFAULT_ASSEMBLE_RESERVE_TOKENS,
+  DEFAULT_ASSEMBLE_SKIP_BUDGET_RATIO,
+  HeadroomContextEngine,
+  resolveAssembleReserveTokens,
+  resolveAssembleSkipBudgetRatio,
+  resolveAssembleSkipThreshold,
+} from "../src/engine.js";
 import { compress } from "headroom-ai";
 
 afterEach(() => {
@@ -500,6 +507,68 @@ describe("HeadroomContextEngine proxy startup helpers", () => {
     });
 
     expect(compress).not.toHaveBeenCalled();
+  });
+
+  it("compresses once history crosses the default skip threshold (below OpenClaw's overflow line)", async () => {
+    vi.mocked(compress).mockResolvedValue({
+      compressed: false,
+      messages: [],
+      tokensBefore: 0,
+      tokensAfter: 0,
+      tokensSaved: 0,
+    });
+    const engine = new HeadroomContextEngine();
+    (engine as { proxyUrl: string | null }).proxyUrl = "http://127.0.0.1:8787";
+    // Default threshold = (200k − 20k reserve) × 0.7 = 126k tokens.
+    // ~4 chars/token → 520k chars ≈ 130k rough tokens. The old flat 85 % rule
+    // (170k) skipped this even though OpenClaw — which also counts the system
+    // prompt and its reserve — would already be compacting.
+    const messages = [{ role: "user", content: "x".repeat(520_000) }];
+
+    await engine.assemble({ sessionId: "session-1", messages, tokenBudget: 200_000 });
+
+    expect(compress).toHaveBeenCalledTimes(1);
+  });
+
+  it("honours configured assembleSkipBudgetRatio / assembleReserveTokens and clamps invalid values", async () => {
+    vi.mocked(compress).mockResolvedValue({
+      compressed: false,
+      messages: [],
+      tokensBefore: 0,
+      tokensAfter: 0,
+      tokensSaved: 0,
+    });
+    const messages = [{ role: "user", content: "x".repeat(300_000) }]; // ≈75k tokens
+
+    // (100k − 20k) × 0.9 = 72k → 75k compresses.
+    const strict = new HeadroomContextEngine({ assembleSkipBudgetRatio: 0.9, assembleReserveTokens: 0 });
+    (strict as { proxyUrl: string | null }).proxyUrl = "http://127.0.0.1:8787";
+    await strict.assemble({ sessionId: "s", messages, tokenBudget: 100_000 });
+    expect(compress).not.toHaveBeenCalled(); // reserve 0 → 90k threshold → skip
+
+    // A large system prompt is modelled via the reserve: (100k − 60k) × 0.7 = 28k → compress.
+    const bigSystemPrompt = new HeadroomContextEngine({ assembleReserveTokens: 60_000 });
+    (bigSystemPrompt as { proxyUrl: string | null }).proxyUrl = "http://127.0.0.1:8787";
+    await bigSystemPrompt.assemble({ sessionId: "s", messages, tokenBudget: 100_000 });
+    expect(compress).toHaveBeenCalledTimes(1);
+
+    expect(resolveAssembleSkipThreshold({ tokenBudget: 200_000 })).toBe(126_000);
+    expect(resolveAssembleSkipThreshold({ tokenBudget: 100_000, ratio: 0.5, reserveTokens: 0 })).toBe(50_000);
+    // Reserve larger than the budget never disables compression entirely.
+    expect(resolveAssembleSkipThreshold({ tokenBudget: 10_000, reserveTokens: 50_000 })).toBe(1);
+
+    expect(resolveAssembleSkipBudgetRatio(undefined)).toBe(DEFAULT_ASSEMBLE_SKIP_BUDGET_RATIO);
+    expect(resolveAssembleSkipBudgetRatio(0)).toBe(DEFAULT_ASSEMBLE_SKIP_BUDGET_RATIO);
+    expect(resolveAssembleSkipBudgetRatio(1.5)).toBe(DEFAULT_ASSEMBLE_SKIP_BUDGET_RATIO);
+    expect(resolveAssembleSkipBudgetRatio(Number.NaN)).toBe(DEFAULT_ASSEMBLE_SKIP_BUDGET_RATIO);
+    expect(resolveAssembleSkipBudgetRatio(1)).toBe(1);
+    expect(resolveAssembleSkipBudgetRatio(0.55)).toBe(0.55);
+
+    expect(resolveAssembleReserveTokens(undefined)).toBe(DEFAULT_ASSEMBLE_RESERVE_TOKENS);
+    expect(resolveAssembleReserveTokens(-1)).toBe(DEFAULT_ASSEMBLE_RESERVE_TOKENS);
+    expect(resolveAssembleReserveTokens(Number.NaN)).toBe(DEFAULT_ASSEMBLE_RESERVE_TOKENS);
+    expect(resolveAssembleReserveTokens(0)).toBe(0);
+    expect(resolveAssembleReserveTokens(12_345.9)).toBe(12_345);
   });
 
   it("passes assembleCompressConfig to compress via headroom-ai SDK", async () => {

@@ -130,7 +130,7 @@ OpenClaw SQLite transcript (AgentMessage[])
 
 ### Repro A — Empty `view_image` result after assemble (BUG-1, BUG-3)
 
-**Prerequisites:** Headroom plugin enabled, proxy reachable, context large enough to trigger compress (`roughTokens >= tokenBudget * 0.85`) or force by lowering budget in test.
+**Prerequisites:** Headroom plugin enabled, proxy reachable, context large enough to trigger compress (`roughTokens >= (tokenBudget − assembleReserveTokens) × assembleSkipBudgetRatio`, defaults 20000 / 0.7) or force by lowering budget in test.
 
 1. Start OpenClaw with `plugins.slots.contextEngine: "headroom"` and `headroom.config.proxyUrl` pointing at a running proxy.
 2. Open a dashboard session with a vision-capable model.
