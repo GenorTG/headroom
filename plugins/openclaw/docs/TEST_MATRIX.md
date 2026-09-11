@@ -4,7 +4,7 @@ Run everything:
 
 ```bash
 cd plugins/openclaw
-npm test                    # 292 vitest cases
+npm test                    # 295 vitest cases
 npm run typecheck
 npm run build
 npm run test:stress         # native-tool mock stress
@@ -20,6 +20,7 @@ npm run test:live-stress    # optional; requires Headroom proxy on :8787
 | Turn advancement idempotent | Retry/restart must not duplicate | `test/turn-advancement-store.test.ts` |
 | Failed persist → retry returns `committed` | Key must not be cached on failure | `test/turn-advancement-store.test.ts` |
 | Two instances / two processes preserve all keys | Last-write-wins clobbering | `test/turn-advancement-store.test.ts` |
+| Store keeps digests only; v1 message bodies dropped on migration; retention prunes by age and cap | Unbounded store growth, transcript duplication on disk | `test/turn-advancement-store.test.ts` |
 | Fresh empty lock is never stolen (two-process boundary) | `open(wx)` window let a second writer unlink a live lock | `test/store-lock.test.ts` |
 | Stale recovery needs age **and** dead owner; EPERM = alive; hard ceiling for PID reuse | Any unreadable lock was treated as stale | `test/store-lock.test.ts` |
 

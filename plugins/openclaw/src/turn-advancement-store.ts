@@ -3,6 +3,12 @@
  *
  * Keys turns by advancementKey and persists to disk so host retries and gateway
  * restarts collapse to the same committed record.
+ *
+ * OpenClaw owns the canonical transcript, so the store only keeps what the
+ * idempotency contract needs: the key, a digest of the accepted messages (for
+ * conflict detection), and bookkeeping metadata. Message bodies are never
+ * written to disk, and old records are pruned so the file stays small enough
+ * to rewrite synchronously on every commit.
  */
 
 import { createHash } from "node:crypto";
@@ -13,11 +19,23 @@ import { type StoreLockOptions, withStoreLock } from "./store-lock.js";
 
 export interface TurnAdvancementRecord {
   advancementKey: string;
-  messages: unknown[];
   messagesDigest: string;
+  messageCount: number;
   sessionId: string;
   committedAtMs: number;
 }
+
+export interface TurnAdvancementRetention {
+  /** Records older than this are pruned on the next commit. */
+  maxAgeMs: number;
+  /** Hard cap on persisted records; the oldest committed are pruned first. */
+  maxRecords: number;
+}
+
+export const DEFAULT_TURN_ADVANCEMENT_RETENTION: TurnAdvancementRetention = {
+  maxAgeMs: 14 * 24 * 60 * 60 * 1000,
+  maxRecords: 5_000,
+};
 
 export interface TurnAdvancementStoreOptions {
   storePath: string;
@@ -25,12 +43,34 @@ export interface TurnAdvancementStoreOptions {
   injectBeforePersist?: () => void;
   /** Lock tuning (timeouts / stale thresholds); defaults suit production. */
   lockOptions?: StoreLockOptions;
+  /** Retention tuning; defaults suit production. */
+  retention?: Partial<TurnAdvancementRetention>;
+  /** Clock override for deterministic retention tests. */
+  now?: () => number;
 }
 
-interface PersistedTurnAdvancements {
+/** Legacy on-disk shape (v1) that embedded full message bodies. */
+interface PersistedTurnAdvancementV1 {
+  advancementKey: string;
+  messages?: unknown[];
+  messagesDigest: string;
+  sessionId: string;
+  committedAtMs: number;
+}
+
+interface PersistedTurnAdvancementsV1 {
   version: 1;
+  records: Record<string, PersistedTurnAdvancementV1>;
+}
+
+interface PersistedTurnAdvancementsV2 {
+  version: 2;
   records: Record<string, TurnAdvancementRecord>;
 }
+
+type PersistedTurnAdvancements =
+  | PersistedTurnAdvancementsV1
+  | PersistedTurnAdvancementsV2;
 
 export function digestTurnMessages(messages: unknown[]): string {
   return createHash("sha256").update(JSON.stringify(messages)).digest("hex");
@@ -60,12 +100,29 @@ export function resolveTurnAdvancementStorePath(params: {
   return join(stateDir, "headroom-turn-advancements.json");
 }
 
+function migrateV1Record(record: PersistedTurnAdvancementV1): TurnAdvancementRecord {
+  return {
+    advancementKey: record.advancementKey,
+    messagesDigest: record.messagesDigest,
+    messageCount: Array.isArray(record.messages) ? record.messages.length : 0,
+    sessionId: record.sessionId,
+    committedAtMs: record.committedAtMs,
+  };
+}
+
 function loadPersistedRecords(storePath: string): Map<string, TurnAdvancementRecord> {
   const records = new Map<string, TurnAdvancementRecord>();
   try {
     const raw = readFileSync(storePath, "utf8");
     const parsed = JSON.parse(raw) as PersistedTurnAdvancements;
-    if (parsed.version === 1 && parsed.records) {
+    if (!parsed.records) {
+      return records;
+    }
+    if (parsed.version === 1) {
+      for (const [key, record] of Object.entries(parsed.records)) {
+        records.set(key, migrateV1Record(record));
+      }
+    } else if (parsed.version === 2) {
       for (const [key, record] of Object.entries(parsed.records)) {
         records.set(key, record);
       }
@@ -79,6 +136,32 @@ function loadPersistedRecords(storePath: string): Map<string, TurnAdvancementRec
   return records;
 }
 
+/**
+ * Drop records that fall outside the retention window. The record being
+ * committed (`keepKey`) is always retained regardless of the cap.
+ */
+export function pruneTurnAdvancementRecords(
+  records: Map<string, TurnAdvancementRecord>,
+  params: { retention: TurnAdvancementRetention; nowMs: number; keepKey: string },
+): Map<string, TurnAdvancementRecord> {
+  const cutoffMs = params.nowMs - params.retention.maxAgeMs;
+  const kept = [...records.values()].filter(
+    (record) => record.advancementKey === params.keepKey || record.committedAtMs >= cutoffMs,
+  );
+  kept.sort((a, b) => a.committedAtMs - b.committedAtMs);
+
+  const maxRecords = Math.max(1, params.retention.maxRecords);
+  while (kept.length > maxRecords) {
+    const index = kept.findIndex((record) => record.advancementKey !== params.keepKey);
+    if (index === -1) {
+      break;
+    }
+    kept.splice(index, 1);
+  }
+
+  return new Map(kept.map((record) => [record.advancementKey, record]));
+}
+
 function persistRecords(
   storePath: string,
   records: Map<string, TurnAdvancementRecord>,
@@ -86,8 +169,8 @@ function persistRecords(
 ): void {
   mkdirSync(dirname(storePath), { recursive: true });
   injectBeforePersist?.();
-  const payload: PersistedTurnAdvancements = {
-    version: 1,
+  const payload: PersistedTurnAdvancementsV2 = {
+    version: 2,
     records: Object.fromEntries(records),
   };
   const tmpPath = `${storePath}.tmp`;
@@ -98,8 +181,13 @@ function persistRecords(
 export class TurnAdvancementStore {
   private records = new Map<string, TurnAdvancementRecord>();
   private loaded = false;
+  private readonly retention: TurnAdvancementRetention;
+  private readonly now: () => number;
 
-  constructor(private readonly options: TurnAdvancementStoreOptions) {}
+  constructor(private readonly options: TurnAdvancementStoreOptions) {
+    this.retention = { ...DEFAULT_TURN_ADVANCEMENT_RETENTION, ...options.retention };
+    this.now = options.now ?? Date.now;
+  }
 
   commit(params: {
     advancementKey: string;
@@ -121,16 +209,22 @@ export class TurnAdvancementStore {
         );
       }
 
+      const nowMs = this.now();
       const record: TurnAdvancementRecord = {
         advancementKey: params.advancementKey,
-        messages: params.messages,
         messagesDigest: digest,
+        messageCount: params.messages.length,
         sessionId: params.sessionId,
-        committedAtMs: Date.now(),
+        committedAtMs: nowMs,
       };
 
-      const nextRecords = new Map(records);
-      nextRecords.set(params.advancementKey, record);
+      const withRecord = new Map(records);
+      withRecord.set(params.advancementKey, record);
+      const nextRecords = pruneTurnAdvancementRecords(withRecord, {
+        retention: this.retention,
+        nowMs,
+        keepKey: params.advancementKey,
+      });
       // If persist throws, the key is not cached as committed and a retry
       // returns "committed" (not "duplicate") after re-reading disk under lock.
       persistRecords(this.options.storePath, nextRecords, this.options.injectBeforePersist);

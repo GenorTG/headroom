@@ -10,7 +10,7 @@ The plugin on `main` is a good design; this PR is the result of running it in pr
 
 | Area | `main` today | This PR | Why |
 |------|--------------|---------|-----|
-| **Turn contract** | Engine does not declare `transcriptSemantics` or implement `commitTurn()` | Declares `currentTurnFence` + `turnAdvancementIdempotency`; `commitTurn()` durably persists the accepted `messages` keyed by `advancementKey`, returns `duplicate` on retry / after restart | On 2026.9.x the runtime logs `Context engine "headroom" degraded to "legacy" for this logical turn` every turn and never calls `assemble()`. Without this, the plugin does nothing. |
+| **Turn contract** | Engine does not declare `transcriptSemantics` or implement `commitTurn()` | Declares `currentTurnFence` + `turnAdvancementIdempotency`; `commitTurn()` durably records the accepted turn (key + SHA-256 digest of `messages`, no message bodies) keyed by `advancementKey`, returns `duplicate` on retry / after restart | On 2026.9.x the runtime logs `Context engine "headroom" degraded to "legacy" for this logical turn` every turn and never calls `assemble()`. Without this, the plugin does nothing. |
 | **Turn-store locking** | n/a | `store-lock.ts`: ownership published atomically (hard-link publish, `O_EXCL` fallback); a lock is stale only when *old* **and** its owner is provably gone (EPERM counts as alive); recovery via atomic `rename`; release never unlinks someone else's lock | Round-4 review reproduced a live lock being unlinked during the `open(wx)` → PID-write window. |
 | **Tool payloads through the proxy** | `extractText()` flattens tool content; images dropped; `toolName` falls back to `"headroom"` | Non-text blocks never leave the process — a short placeholder goes on the wire — and are restored from the local originals by `tool_call_id` / position. OpenAI `tool.name` set from `toolName`. | Vision/browser/`view_image` results were silently lost; the proxy's protect list keys on tool names. An intermediate design that sent blocks as base64 text inflated a 60 KB image to ~50k tokens and depended on the proxy echoing `_headroomMeta`, which it does not do reliably — replaced. |
 | **Durable compaction** | `ownsCompaction: false`, `compact()` → `delegateCompactionToRuntime()` (#2304) | **Same default** (`persistentCompaction: "openclaw"`). Opt-in `"hybrid"` (Headroom replace-only pre-pass + turn-end hygiene, OpenClaw still summarizes) and `"headroom"` (zero-LLM `/v1/compress` rewrite, `ownsCompaction: true`) | Upstream's delegation is correct and stays the default. The opt-in modes exist for very large tool-heavy transcripts where LLM `/compact` is slow or fails. |
@@ -46,7 +46,7 @@ All changes are confined to `plugins/openclaw/`. No Python runtime or proxy chan
 
 **Always-on fixes (no config needed)**
 - `engine.ts` — declare `transcriptSemantics`; `commitTurn()` → `TurnAdvancementStore`; budget short-circuit in `assemble()`; CCR retrieve hint only when `ccrHashes` is non-empty; pass local originals to `openAIToAgent`.
-- `turn-advancement-store.ts` + `store-lock.ts` — durable, idempotent advancement keyed by `advancementKey`; reload-under-lock; atomic temp+rename persist; safe cross-process lock protocol (see table).
+- `turn-advancement-store.ts` + `store-lock.ts` — durable, idempotent advancement keyed by `advancementKey`; records hold only a digest of the accepted messages (OpenClaw owns the transcript) and are pruned after 14 days / 5 000 records so the file stays small; v1 files that embedded message bodies are migrated on first commit; reload-under-lock; atomic temp+rename persist; safe cross-process lock protocol (see table).
 - `convert.ts`, `content-blocks.ts`, `original-lookup.ts` — placeholder wire format for non-text blocks; originals-based restore (`tool_call_id` → `hrIndex` hint → position); OpenAI `tool.name`; `isError` preserved; fixed per-image token estimate; assistant text no longer duplicated across blocks.
 - `compaction.ts` + `truncate-boundary.ts` — turn-aligned truncation, orphan `toolResult` removal, `resetLeaf()`; replace-mode skips protected payloads; `protect_recent: 2` (`compress-request-config.ts`).
 
@@ -73,7 +73,7 @@ The plugin is TypeScript, so the Python commands in the template do not apply; t
 ```text
 $ cd plugins/openclaw && npm test
  Test Files  21 passed (21)
-      Tests  292 passed (292)
+      Tests  295 passed (295)
 $ npm run typecheck        # clean
 $ npm run build            # dist/index.js 81.75 KB
 $ node test/live-compress-smoke.mjs   # against a running Headroom proxy
@@ -142,7 +142,7 @@ Full coverage map: `docs/TEST_MATRIX.md`.
 - [x] I have commented my code, particularly in hard-to-understand areas
 - [x] I have made corresponding changes to the documentation (`README.md`, `docs/*`, `openclaw.plugin.json` schema)
 - [x] My changes generate no new warnings (`npm run typecheck`, `npm run build` clean)
-- [x] I have added tests that prove my fix is effective or that my feature works (292 vitest cases; reviewer fixtures locked as regressions)
+- [x] I have added tests that prove my fix is effective or that my feature works (295 vitest cases; reviewer fixtures locked as regressions)
 - [x] New and existing unit tests pass locally with my changes
 - [x] I did **not** edit `CHANGELOG.md` — it is generated by release-please from my Conventional Commit PR title (a CI guard enforces this)
 

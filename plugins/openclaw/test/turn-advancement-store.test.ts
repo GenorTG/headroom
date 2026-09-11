@@ -79,7 +79,122 @@ describe("TurnAdvancementStore", () => {
     expect(second.has("turn-restart")).toBe(true);
 
     const persisted = JSON.parse(readFileSync(storePath, "utf8"));
-    expect(persisted.records["turn-restart"].messages).toEqual(messages);
+    expect(persisted.version).toBe(2);
+    expect(persisted.records["turn-restart"]).toMatchObject({
+      advancementKey: "turn-restart",
+      sessionId: "session-1",
+      messageCount: 1,
+      messagesDigest: digestTurnMessages(messages),
+    });
+    // OpenClaw owns the transcript; message bodies must never hit this file.
+    expect(persisted.records["turn-restart"]).not.toHaveProperty("messages");
+    expect(readFileSync(storePath, "utf8")).not.toContain("done");
+  });
+
+  it("migrates a v1 store that embedded message bodies and drops them on rewrite", () => {
+    const storePath = makeStorePath();
+    const legacyMessages = [{ role: "assistant", content: "legacy body text" }];
+    writeFileSync(
+      storePath,
+      JSON.stringify({
+        version: 1,
+        records: {
+          "turn-legacy": {
+            advancementKey: "turn-legacy",
+            messages: legacyMessages,
+            messagesDigest: digestTurnMessages(legacyMessages),
+            sessionId: "session-legacy",
+            committedAtMs: Date.now(),
+          },
+        },
+      }),
+    );
+
+    const store = new TurnAdvancementStore({ storePath });
+    expect(
+      store.commit({
+        advancementKey: "turn-legacy",
+        sessionId: "session-legacy",
+        messages: legacyMessages,
+      }),
+    ).toBe("duplicate");
+    expect(() =>
+      store.commit({
+        advancementKey: "turn-legacy",
+        sessionId: "session-legacy",
+        messages: [{ role: "assistant", content: "different" }],
+      }),
+    ).toThrow(/key conflict/);
+
+    expect(
+      store.commit({
+        advancementKey: "turn-new",
+        sessionId: "session-legacy",
+        messages: [{ role: "user", content: "new" }],
+      }),
+    ).toBe("committed");
+
+    const raw = readFileSync(storePath, "utf8");
+    const persisted = JSON.parse(raw);
+    expect(persisted.version).toBe(2);
+    expect(Object.keys(persisted.records).sort()).toEqual(["turn-legacy", "turn-new"]);
+    expect(persisted.records["turn-legacy"]).toEqual({
+      advancementKey: "turn-legacy",
+      messagesDigest: digestTurnMessages(legacyMessages),
+      messageCount: 1,
+      sessionId: "session-legacy",
+      committedAtMs: expect.any(Number),
+    });
+    expect(raw).not.toContain("legacy body text");
+  });
+
+  it("prunes records past maxAgeMs and beyond maxRecords, never the record being committed", () => {
+    const storePath = makeStorePath();
+    let nowMs = 1_000_000;
+    const store = new TurnAdvancementStore({
+      storePath,
+      retention: { maxAgeMs: 10_000, maxRecords: 3 },
+      now: () => nowMs,
+    });
+    const commit = (key: string) =>
+      store.commit({
+        advancementKey: key,
+        sessionId: "session-1",
+        messages: [{ role: "user", content: key }],
+      });
+
+    commit("old-1");
+    nowMs += 1_000;
+    commit("old-2");
+    nowMs += 20_000; // both above are now past maxAgeMs
+    commit("fresh-1");
+    let persisted = JSON.parse(readFileSync(storePath, "utf8"));
+    expect(Object.keys(persisted.records)).toEqual(["fresh-1"]);
+
+    nowMs += 1;
+    commit("fresh-2");
+    nowMs += 1;
+    commit("fresh-3");
+    nowMs += 1;
+    commit("fresh-4"); // cap of 3 → oldest fresh-1 pruned
+    persisted = JSON.parse(readFileSync(storePath, "utf8"));
+    expect(Object.keys(persisted.records).sort()).toEqual(["fresh-2", "fresh-3", "fresh-4"]);
+
+    // A pruned key is no longer a duplicate; re-committing it is accepted.
+    expect(commit("fresh-1")).toBe("committed");
+    expect(store.has("fresh-1")).toBe(true);
+  });
+
+  it("keeps the committed record even when maxRecords is smaller than the batch", () => {
+    const storePath = makeStorePath();
+    const store = new TurnAdvancementStore({
+      storePath,
+      retention: { maxAgeMs: 1_000_000, maxRecords: 1 },
+    });
+    store.commit({ advancementKey: "a", sessionId: "s", messages: ["a"] });
+    store.commit({ advancementKey: "b", sessionId: "s", messages: ["b"] });
+    const persisted = JSON.parse(readFileSync(storePath, "utf8"));
+    expect(Object.keys(persisted.records)).toEqual(["b"]);
   });
 
   it("throws when a retry presents the same key with different messages", () => {
@@ -367,9 +482,9 @@ describe("TurnAdvancementStore", () => {
 
     const persisted = JSON.parse(readFileSync(storePath, "utf8"));
     expect(Object.keys(persisted.records)).toEqual(["turn-ok"]);
-    expect(persisted.records["turn-ok"].messages).toEqual([
-      { role: "user", content: "ok" },
-    ]);
+    expect(persisted.records["turn-ok"].messagesDigest).toBe(
+      digestTurnMessages([{ role: "user", content: "ok" }]),
+    );
   });
 
   it("preserves all keys when two instances commit in alternating order", () => {
