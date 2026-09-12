@@ -30,6 +30,7 @@ import {
   serializeBlocksForWire,
 } from "./content-blocks.js";
 import { buildOriginalLookup, findOriginal } from "./original-lookup.js";
+import { buildToolCallNameMap, isProtectedToolName, resolveToolName } from "./tool-names.js";
 
 /** Joiner for text blocks inside tool results and user messages on the wire. */
 const BLOCK_JOINER = "\n";
@@ -90,16 +91,27 @@ export interface OpenAIToAgentOptions {
    * metadata are restored from these instead of from proxy-echoed metadata.
    */
   originals?: any[];
+  /**
+   * Lowercase tool names (or `*` globs) whose results are restored verbatim from
+   * `originals`, whatever the proxy returned for them. Matched against the
+   * resolved tool name and its aliases (see `tool-names.ts`). Requires `originals`.
+   */
+  protectedToolNames?: ReadonlySet<string>;
 }
 
 /**
  * Convert AgentMessage[] to OpenAI message format for compression.
+ *
+ * Deferred `tool_call` wrappers are sent under their resolved tool name so the
+ * proxy's per-tool protection/exclusion lists can match them; the wrapper name
+ * itself is restored from the originals by `openAIToAgent`.
  */
 export function agentToOpenAI(messages: any[]): OpenAIMessage[] {
   const result: OpenAIMessage[] = [];
+  const normalizedMessages = normalizeAgentMessages(messages);
+  const toolCallNames = buildToolCallNameMap(normalizedMessages);
 
-  messages.forEach((msg, index) => {
-    const normalized = normalizeAgentMessage(msg);
+  normalizedMessages.forEach((normalized, index) => {
     const role = normalized.role;
 
     const buildMeta = (): Record<string, unknown> => {
@@ -167,7 +179,7 @@ export function agentToOpenAI(messages: any[]): OpenAIMessage[] {
               id: block.id,
               type: "function",
               function: {
-                name: block.name,
+                name: resolveToolName(typeof block.name === "string" ? block.name : "", args),
                 arguments: typeof args === "string" ? args : JSON.stringify(args ?? {}),
               },
             });
@@ -189,13 +201,15 @@ export function agentToOpenAI(messages: any[]): OpenAIMessage[] {
 
     if (role === "toolResult" || role === "tool_result") {
       const toolBlocks = normalizeToolResultContent(normalized.content);
-      const toolName =
+      const toolCallId = typeof normalized.toolCallId === "string" ? normalized.toolCallId : "unknown";
+      const rawToolName =
         typeof normalized.toolName === "string" ? normalized.toolName : undefined;
+      const toolName = toolCallNames.get(toolCallId) ?? rawToolName;
 
       result.push({
         role: "tool",
         content: serializeBlocksForWire(toolBlocks, BLOCK_JOINER),
-        tool_call_id: normalized.toolCallId ?? "unknown",
+        tool_call_id: toolCallId,
         ...(toolName ? { name: toolName } : {}),
         _headroomMeta: buildMeta(),
       });
@@ -226,9 +240,13 @@ export function openAIToAgent(
   messages: OpenAIMessage[],
   options: OpenAIToAgentOptions = {},
 ): any[] {
-  const lookup = options.originals
-    ? buildOriginalLookup(normalizeAgentMessages(options.originals))
-    : null;
+  const normalizedOriginals = options.originals ? normalizeAgentMessages(options.originals) : null;
+  const lookup = normalizedOriginals ? buildOriginalLookup(normalizedOriginals) : null;
+  const protectedToolNames = options.protectedToolNames ?? new Set<string>();
+  const originalToolCallNames =
+    normalizedOriginals && protectedToolNames.size > 0
+      ? buildToolCallNameMap(normalizedOriginals)
+      : new Map<string, string>();
   const result: any[] = [];
 
   messages.forEach((msg, index) => {
@@ -277,7 +295,14 @@ export function openAIToAgent(
     if (msg.role === "tool") {
       const wireCallId = msg.tool_call_id ?? "unknown";
       const toolCallId = typeof base.toolCallId === "string" ? base.toolCallId : wireCallId;
-      const content = restoreToolResultContent(msg, original);
+      const content = isProtectedToolResult({
+        original,
+        toolCallId,
+        originalToolCallNames,
+        protectedToolNames,
+      })
+        ? normalizeToolResultContent(original?.content)
+        : restoreToolResultContent(msg, original);
       result.push({
         ...base,
         role: "toolResult",
@@ -359,6 +384,25 @@ function restoreAssistantContent(
     blocks.push({ type: "toolCall", id: tc.id, name: tc.function.name, arguments: input });
   }
   return blocks;
+}
+
+/**
+ * True when the tool result belongs to a protected tool. The tool name comes from
+ * the original assistant `toolCall` block (wrapper-resolved), falling back to the
+ * original result's `toolName`.
+ */
+function isProtectedToolResult(params: {
+  original: Record<string, unknown> | null;
+  toolCallId: string;
+  originalToolCallNames: ReadonlyMap<string, string>;
+  protectedToolNames: ReadonlySet<string>;
+}): boolean {
+  const { original, toolCallId, originalToolCallNames, protectedToolNames } = params;
+  if (!original || protectedToolNames.size === 0) return false;
+  const fromCall = originalToolCallNames.get(toolCallId);
+  const fromResult = typeof original.toolName === "string" ? original.toolName : undefined;
+  const name = fromCall ?? fromResult;
+  return typeof name === "string" && isProtectedToolName(name, protectedToolNames);
 }
 
 function restoreToolResultContent(

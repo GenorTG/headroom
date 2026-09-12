@@ -52,6 +52,7 @@ import {
   type CompressRequestConfig,
 } from "./compress-request-config.js";
 import { decideAssembleSkip, providerIdFromRuntimeSettings } from "./assemble-skip.js";
+import { normalizeProtectedToolNames } from "./tool-names.js";
 
 type HeadroomCompactParams = OpenClawCompactParams & {
   sessionTarget?: {
@@ -149,6 +150,14 @@ export interface HeadroomEngineConfig
    */
   assembleReserveTokens?: number;
   /**
+   * Tool names (or `*` globs) whose results are restored verbatim after every
+   * `/v1/compress` round trip (assemble and durable compaction), whatever the
+   * proxy returned for them. Deferred `tool_call` wrappers are resolved to the
+   * real tool first, so an MCP tool can be named as `analyze_video`,
+   * `<server>__analyze_video` or `mcp__<server>__analyze_video`. Default: none.
+   */
+  protectToolResults?: string[];
+  /**
    * Skip `assemble()` compression when the current model's provider is routed
    * through the proxy via `gatewayProviderIds` (avoids double compression — see
    * BUG-6). Providers that are not routed still get `assemble()` compression.
@@ -199,6 +208,7 @@ export class HeadroomContextEngine {
   private turnAdvancementStores = new Map<string, TurnAdvancementStore>();
   private readonly hygieneDebounce = new HygieneDebounceTracker();
   private readonly transcriptProjectionWaitMs: number;
+  private readonly protectedToolNames: ReadonlySet<string>;
 
   constructor(config: HeadroomEngineConfig = {}, logger?: ProxyManagerLogger) {
     this.config = config;
@@ -208,6 +218,7 @@ export class HeadroomContextEngine {
       this.persistentCompactionMode,
     );
     this.transcriptProjectionWaitMs = config.transcriptProjectionWaitMs ?? 120_000;
+    this.protectedToolNames = normalizeProtectedToolNames(config.protectToolResults);
     this.logger = logger ?? defaultLogger;
     this.proxyManager = new ProxyManager(config, this.logger);
   }
@@ -338,6 +349,7 @@ export class HeadroomContextEngine {
       // from the originals (the proxy does not reliably echo `_headroomMeta`).
       const compressedAgentMessages = openAIToAgent(result.messages, {
         originals: params.messages,
+        protectedToolNames: this.protectedToolNames,
       });
       this.resetCircuit();
 
@@ -428,6 +440,7 @@ export class HeadroomContextEngine {
         timeoutMs: this.config.requestTimeoutMs ?? 30_000,
         abortSignal: headroomParams.abortSignal,
         force: headroomParams.force === true,
+        protectedToolNames: this.protectedToolNames,
       });
 
       if (plan.mode === "none") {

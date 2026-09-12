@@ -308,6 +308,131 @@ describe("openAIToAgent with originals — restore regardless of proxy echo", ()
   });
 });
 
+describe("deferred tool_call wrappers and protectToolResults", () => {
+  const VIDEO_ID = "mcp:openrouter-video-vision:openrouter-video-vision__analyze_video";
+  const VIDEO_TEXT = "t=0.5s the walker moves; t=1.5s it pauses at the gate; t=2.5s it resumes.";
+  const PIXEL_TEXT = "[{\"id\":\"char_1\"},{\"id\":\"char_2\"}]";
+
+  const originals = [
+    { role: "user", content: "check the clip and list characters" },
+    {
+      role: "assistant",
+      content: [
+        {
+          type: "toolCall",
+          id: "call_video",
+          name: "tool_call",
+          arguments: { id: VIDEO_ID, args: { video_path: "/tmp/c.mp4", prompt: "bugs?" } },
+        },
+        {
+          type: "toolCall",
+          id: "call_pixel",
+          name: "tool_call",
+          arguments: JSON.stringify({ id: "mcp:pixellab:pixellab__list_characters", args: {} }),
+        },
+        { type: "toolCall", id: "call_exec", name: "exec", arguments: { command: "ls" } },
+      ],
+    },
+    { role: "toolResult", toolCallId: "call_video", toolName: "tool_call", content: VIDEO_TEXT },
+    { role: "toolResult", toolCallId: "call_pixel", toolName: "tool_call", content: PIXEL_TEXT },
+    { role: "toolResult", toolCallId: "call_exec", toolName: "exec", content: "a\nb\n" },
+  ];
+
+  it("sends resolved tool names on the wire instead of the tool_call wrapper", () => {
+    const wire = agentToOpenAI(originals);
+    const assistant = wire[1];
+    expect(assistant.tool_calls?.map((tc: { function: { name: string } }) => tc.function.name)).toEqual([
+      "mcp__openrouter-video-vision__analyze_video",
+      "mcp__pixellab__list_characters",
+      "exec",
+    ]);
+    expect(wire[2]).toMatchObject({ role: "tool", tool_call_id: "call_video", name: "mcp__openrouter-video-vision__analyze_video" });
+    expect(wire[3]).toMatchObject({ role: "tool", tool_call_id: "call_pixel", name: "mcp__pixellab__list_characters" });
+    expect(wire[4]).toMatchObject({ role: "tool", tool_call_id: "call_exec", name: "exec" });
+    // Wrapper arguments are passed through unchanged so the proxy can still see them.
+    expect(JSON.parse(assistant.tool_calls?.[0].function.arguments)).toEqual({
+      id: VIDEO_ID,
+      args: { video_path: "/tmp/c.mp4", prompt: "bugs?" },
+    });
+  });
+
+  it("restores the wrapper name and original toolCall blocks after the round trip", () => {
+    const wire = agentToOpenAI(originals);
+    const restored = openAIToAgent(wire, { originals });
+    const assistant = restored[1] as { content: Array<{ type: string; name?: string; id?: string }> };
+    expect(assistant.content.filter((b) => b.type === "toolCall").map((b) => b.name)).toEqual([
+      "tool_call",
+      "tool_call",
+      "exec",
+    ]);
+    expect(restored[2]).toMatchObject({ role: "toolResult", toolName: "tool_call", toolCallId: "call_video" });
+  });
+
+  function compressedByProxy(wire: OpenAIMessage[]): OpenAIMessage[] {
+    return wire.map((msg) =>
+      msg.role === "tool" ? { ...msg, content: `[compressed ${msg.tool_call_id}]`, _headroomMeta: undefined } : msg,
+    );
+  }
+
+  it("restores protected tool results verbatim and leaves others compressed", () => {
+    const wire = compressedByProxy(agentToOpenAI(originals));
+    const restored = openAIToAgent(wire, {
+      originals,
+      protectedToolNames: new Set(["analyze_video"]),
+    });
+
+    expect(restored[2]).toMatchObject({
+      toolCallId: "call_video",
+      content: [{ type: "text", text: VIDEO_TEXT }],
+    });
+    expect(restored[3]).toMatchObject({
+      toolCallId: "call_pixel",
+      content: [{ type: "text", text: "[compressed call_pixel]" }],
+    });
+    expect(restored[4]).toMatchObject({
+      toolCallId: "call_exec",
+      content: [{ type: "text", text: "[compressed call_exec]" }],
+    });
+  });
+
+  it("matches protected names by canonical, server-prefixed and glob spellings", () => {
+    const wire = compressedByProxy(agentToOpenAI(originals));
+    for (const entry of [
+      "mcp__openrouter-video-vision__analyze_video",
+      "openrouter-video-vision__analyze_video",
+      "mcp__openrouter-video-vision__*",
+    ]) {
+      const restored = openAIToAgent(wire, { originals, protectedToolNames: new Set([entry]) });
+      expect(restored[2]).toMatchObject({ content: [{ type: "text", text: VIDEO_TEXT }] });
+      expect(restored[3]).toMatchObject({ content: [{ type: "text", text: "[compressed call_pixel]" }] });
+    }
+  });
+
+  it("protects plain (non-wrapped) tools by their own name", () => {
+    const wire = compressedByProxy(agentToOpenAI(originals));
+    const restored = openAIToAgent(wire, { originals, protectedToolNames: new Set(["exec"]) });
+    expect(restored[4]).toMatchObject({ content: [{ type: "text", text: "a\nb\n" }] });
+    expect(restored[2]).toMatchObject({ content: [{ type: "text", text: "[compressed call_video]" }] });
+  });
+
+  it("falls back to the result's own toolName when no matching toolCall block exists", () => {
+    const orphan = [{ role: "toolResult", toolCallId: "call_x", toolName: "browser", content: "page" }];
+    const wire = compressedByProxy(agentToOpenAI(orphan));
+    const restored = openAIToAgent(wire, { originals: orphan, protectedToolNames: new Set(["browser"]) });
+    expect(restored[0]).toMatchObject({ content: [{ type: "text", text: "page" }] });
+  });
+
+  it("does nothing without originals or with an empty protected set", () => {
+    const wire = compressedByProxy(agentToOpenAI(originals));
+    expect(openAIToAgent(wire, { protectedToolNames: new Set(["analyze_video"]) })[2]).toMatchObject({
+      content: [{ type: "text", text: "[compressed call_video]" }],
+    });
+    expect(openAIToAgent(wire, { originals, protectedToolNames: new Set() })[2]).toMatchObject({
+      content: [{ type: "text", text: "[compressed call_video]" }],
+    });
+  });
+});
+
 describe("inferToolResultIsError fallback (no originals, no meta)", () => {
   it("flags the OpenClaw error envelope", () => {
     const result = openAIToAgent([
