@@ -52,7 +52,7 @@ paths or credentials.
 
 | File | Role |
 |------|------|
-| `openclaw.plugin.json` | Schema for routing, compaction modes, hygiene, `assembleCompressConfig`, `assembleSkipBudgetRatio`, `assembleReserveTokens`, `skipAssembleWhenGatewayRouted` |
+| `openclaw.plugin.json` | Schema for routing, compaction modes, hygiene, `assembleCompressConfig`, `assembleSkipBudgetRatio`, `assembleReserveTokens`, `protectToolResults`, `skipAssembleWhenGatewayRouted` |
 | `package.json` | Aligns `headroom-ai` with monorepo release (`^0.37.0`); stress test scripts |
 | `package-lock.json` | Locked deps (merged from upstream #3531) |
 
@@ -68,7 +68,7 @@ paths or credentials.
 
 ### Tests
 
-See [TEST_MATRIX.md](./TEST_MATRIX.md). Summary: **297 vitest cases** across 21 files, plus optional live proxy stress scripts.
+See [TEST_MATRIX.md](./TEST_MATRIX.md). Summary: **320 vitest cases** across 22 files, plus optional live proxy stress scripts.
 
 ## Merge with upstream `main` (2026-09-11) — done
 
@@ -88,4 +88,4 @@ Merge commit: `fc7650a`. No plugin source conflicts — auto-merge on lockfiles 
 
 **Always-on fixes (no config required):** transcript semantics, `commitTurn` contract, conversion preservation, assemble budget short-circuit, safer durable compress defaults when compaction modes are enabled.
 
-**Opt-in:** multi-upstream routing maps, session headers, hybrid/headroom compaction, gateway assemble skip, custom `assembleCompressConfig`, custom `assembleSkipBudgetRatio` / `assembleReserveTokens`.
+**Opt-in:** multi-upstream routing maps, session headers, hybrid/headroom compaction, gateway assemble skip, custom `assembleCompressConfig`, custom `assembleSkipBudgetRatio` / `assembleReserveTokens`, `protectToolResults`.

@@ -4,7 +4,7 @@ Run everything:
 
 ```bash
 cd plugins/openclaw
-npm test                    # 297 vitest cases
+npm test                    # 320 vitest cases
 npm run typecheck
 npm run build
 npm run test:stress         # native-tool mock stress
@@ -68,6 +68,8 @@ npm run test:live-stress    # optional; requires Headroom proxy on :8787
 | Wire placeholders + text merge | Structure lost on lossy rewrite | `test/content-blocks.test.ts` |
 | Original lookup by `tool_call_id` / hint / position | N/A on stock | `test/original-lookup.test.ts` |
 | OpenAI `tool.name` from `toolName` | Proxy protect-list miss | `test/convert.test.ts`, `test/stress/...` |
+| Deferred `tool_call` wrappers (OpenClaw `{id: "mcp:<server>:<server>__<tool>"}`, Hermes `{name}`) resolved to the real tool name on the wire; wrapper restored from originals | Every MCP tool reached the proxy as `tool_call`, so no per-tool protect/exclude entry could ever match | `test/tool-names.test.ts`, `test/convert.test.ts` |
+| `protectToolResults`: matching results restored verbatim after compress; other tools stay compressed; bare / server-prefixed / canonical / glob spellings | Vision and other prose tool outputs were paraphrased by lossy compression | `test/tool-names.test.ts`, `test/convert.test.ts` |
 | Assistant thinking/toolCall blocks; no text duplication | Unknown blocks dropped | `test/convert.test.ts` |
 | User embedded `tool_result` | Flattened to text | `test/convert.test.ts` |
 | `isError` after meta strip | Lost on proxy round-trip | `test/convert.test.ts`, `test/stress/...` |

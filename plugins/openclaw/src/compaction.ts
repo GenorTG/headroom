@@ -143,6 +143,8 @@ export async function planHeadroomCompaction(options: {
   timeoutMs: number;
   abortSignal?: AbortSignal;
   force?: boolean;
+  /** Tool names whose results are restored verbatim after compression. */
+  protectedToolNames?: ReadonlySet<string>;
 }): Promise<CompactionPlan> {
   const originals = options.branchMessages.map((entry) => entry.message);
   if (originals.length === 0) {
@@ -168,6 +170,7 @@ export async function planHeadroomCompaction(options: {
     branchMessages: options.branchMessages,
     originals,
     result,
+    protectedToolNames: options.protectedToolNames,
   });
 
   if (
@@ -248,8 +251,9 @@ function buildCompactionPlanFromCompressResult(options: {
   branchMessages: BranchMessageEntry[];
   originals: any[];
   result: DurableCompressResult;
+  protectedToolNames?: ReadonlySet<string>;
 }): CompactionPlan {
-  const { branchMessages, originals, result } = options;
+  const { branchMessages, originals, result, protectedToolNames } = options;
   const tokensBefore = result.tokensBefore;
   const tokensAfter = result.tokensAfter;
 
@@ -257,7 +261,7 @@ function buildCompactionPlanFromCompressResult(options: {
     return { mode: "none", tokensBefore, tokensAfter: tokensBefore };
   }
 
-  const compressedAgent = openAIToAgent(result.messages, { originals });
+  const compressedAgent = openAIToAgent(result.messages, { originals, protectedToolNames });
 
   if (compressedAgent.length === originals.length) {
     const replacements = branchMessages.flatMap((entry, index) => {

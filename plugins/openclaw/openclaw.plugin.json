@@ -78,6 +78,10 @@
       "label": "Assemble Reserve Tokens",
       "help": "Tokens subtracted from tokenBudget before the skip ratio is applied. OpenClaw passes the full model window as tokenBudget but its prompt also carries the system prompt, tool schemas and a compaction reserve (≥ 20000). Set to roughly reserve + system prompt tokens so compression starts before native overflow compaction. Default 20000."
     },
+    "protectToolResults": {
+      "label": "Protect Tool Results",
+      "help": "Tool names (or * globs) whose results are restored verbatim after every /v1/compress round trip (assemble and durable compaction). Deferred tool_call wrappers are resolved to the real tool first, so an MCP tool can be named as analyze_video, <server>__analyze_video or mcp__<server>__analyze_video. The resolved name is also what the proxy sees, so its own --protect-tool-results list can match MCP tools. Default: none."
+    },
     "skipAssembleWhenGatewayRouted": {
       "label": "Skip Assemble When Gateway Routed",
       "help": "When true and gatewayProviderIds is non-empty, skip assemble() compression because live provider traffic already passes through the Headroom proxy (avoids double compression). Default: false."
@@ -210,6 +214,11 @@
         "type": "integer",
         "minimum": 0,
         "default": 20000
+      },
+      "protectToolResults": {
+        "type": "array",
+        "items": { "type": "string", "minLength": 1 },
+        "default": []
       },
       "skipAssembleWhenGatewayRouted": {
         "type": "boolean",
