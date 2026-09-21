@@ -4,7 +4,7 @@
 
 **Goal:** make the Headroom OpenClaw plugin work correctly on OpenClaw 2026.9.x and be safe for tool-heavy agent sessions, **without changing any default that upstream `main` has chosen**. Everything in this PR is either (a) a fix for behavior that is currently broken on the 2026.9.x runtime, or (b) opt-in and off by default.
 
-The plugin on `main` is a good design; this PR is the result of running it in production against a multi-provider OpenClaw gateway and fixing what broke, then hardening those fixes through four review rounds. I have tried to keep each change small, tested, and traceable to a concrete failure.
+The plugin on `main` is a good design; this PR is the result of running it in production against a multi-provider OpenClaw gateway and fixing what broke, then hardening those fixes through review rounds (including a post-approval production fix for frozen `api.config`). I have tried to keep each change small, tested, and traceable to a concrete failure.
 
 ### What differs from `main` today, and why
 
@@ -18,6 +18,7 @@ The plugin on `main` is a good design; this PR is the result of running it in pr
 | **Truncation boundary** | n/a | `truncate-boundary.ts`: the durable tail always starts at a turn start (OpenClaw's own `isTurnStartMessage` rule), never at a `toolResult` or assistant continuation; orphan tool results dropped; `resetLeaf()` used so the prefix is actually removed | Round-3/4 review: `branch(parentId)` retained the prefix, and a raw suffix cut could start at an orphan `toolResult`. |
 | **Multi-upstream routing** | One `*_TARGET_API_URL` per proxy | Opt-in `providerUpstreams` → `x-headroom-base-url` (the proxy's own documented mechanism); protocol-aware path prefix (`/v1` vs `/v1beta` for Gemini) | Real deployments route several OpenAI-compatible APIs through one proxy; Gemini must keep `/v1beta` to reach `handle_gemini_generate_content` (round-1 review). |
 | **Session-gated providers** | n/a | Opt-in `providerSessionHeaders` (per-process UUID under an operator-chosen header) | e.g. opencode-go returns `MissingSessionID` without one. No provider names hardcoded. |
+| **Frozen gateway config** | In-place rewrite assumes `api.config` is mutable | Detect frozen/sealed providers; no-op when disk already routes `baseUrl` + `x-headroom-base-url`; clear error if routing still needed | OpenClaw 2026.9.x freezes plugin config; session-header refresh threw `Cannot assign to read only property 'opencode-go'` even when routing was already correct on disk. |
 | **Assemble cost** | Proxy called every turn | Skip when rough estimate < `(tokenBudget − assembleReserveTokens) × assembleSkipBudgetRatio` (defaults 20000 / 0.7). OpenClaw hands `assemble()` the full window as `tokenBudget` while its overflow precheck also counts the system prompt and a ≥ 20k reserve, so a flat 85 % rule never fired before native compaction on ~200k windows; opt-in, provider-aware `skipAssembleWhenGatewayRouted`; images estimated at a fixed ~1.5k tokens (not `base64.length / 4`) | Sub-budget turns on 1M-window models paid multi-minute compress for 0 savings; base64 length was defeating the budget check. |
 | **Durable compress defaults** | `protect_recent: 0` when hygiene runs | `protect_recent: 2`; replace-mode skips messages with protected tool/image payloads | Avoid rewriting the turn the model is about to answer, and never lossy-rewrite multimodal payloads on disk. |
 
@@ -29,6 +30,8 @@ The plugin on `main` is a good design; this PR is the result of running it in pr
 | 2 | Failed persist returned `duplicate` on retry; cross-instance clobbering; truncate via `branch()` kept the prefix | Reload-under-lock + atomic write; exclusive lock; `resetLeaf()` |
 | 3 | Upstream #2304 flipped to delegation | Adopted as the default; Headroom modes made opt-in |
 | 4 | Empty new lock treated as stale; raw suffix cut at orphan `toolResult`; Windows test failures; stale PR body | `store-lock.ts`; `truncate-boundary.ts`; portable paths/URLs in tests; this rewrite |
+| 5 | Backward boundary alignment understated `tokensAfter` | `adjustTokensAfterForBoundaryAlignment` + regression (approved 2026-09-14) |
+| 6 | Frozen `api.config` TypeError on session-header refresh (`opencode-go`) | Freeze-safe in-place rewrite; no-op when already routed |
 
 Closes # (no upstream issue; surfaced from production use of the plugin on OpenClaw 2026.9.x)
 
@@ -53,7 +56,7 @@ All changes are confined to `plugins/openclaw/`. No Python runtime or proxy chan
 
 **Opt-in (default off / matches upstream)**
 - `compaction-mode.ts`, `openclaw-compaction.ts`, `transcript-hygiene.ts`, `hygiene-debounce.ts`, `transcript-projection.ts` — `persistentCompaction: "openclaw" | "hybrid" | "headroom"` (default `"openclaw"` = upstream delegation); `transcriptHygiene` (on only in `hybrid`).
-- `gateway-config.ts`, `proxy-routing.ts`, `session-headers.ts` — `providerUpstreams`, `/v1` vs `/v1beta`, `providerSessionHeaders`.
+- `gateway-config.ts`, `proxy-routing.ts`, `session-headers.ts` — `providerUpstreams`, `/v1` vs `/v1beta`, `providerSessionHeaders`; freeze-safe in-place rewrite when OpenClaw seals `api.config`.
 - `assemble-skip.ts` — provider-aware `skipAssembleWhenGatewayRouted` (reads `runtimeSettings.model.provider`).
 - `openclaw.plugin.json` — schema for the new keys; `README.md`, `docs/PR_OVERVIEW.md`, `docs/tool-call-preservation.md`, `docs/TEST_MATRIX.md`, `test/README.md`.
 
@@ -73,10 +76,10 @@ The plugin is TypeScript, so the Python commands in the template do not apply; t
 
 ```text
 $ cd plugins/openclaw && npm test
- Test Files  21 passed (21)
-      Tests  320 passed (320)
+ Test Files  22 passed (22)
+      Tests  324 passed (324)
 $ npm run typecheck        # clean
-$ npm run build            # dist/index.js 81.75 KB
+$ npm run build            # dist/index.js 90.65 KB
 $ node test/live-compress-smoke.mjs   # against a running Headroom proxy
 Request tool.name: view_image
 Response has image block: true
@@ -84,6 +87,7 @@ PASS: live compress smoke test — image payload preserved
 ```
 
 New/updated tests for this round:
+- `test/gateway-config.test.ts` — frozen/sealed OpenClaw `api.config` no-ops when already routed; clear error when routing still needed; mutable path still injects session headers.
 - `test/store-lock.test.ts` — fresh empty lock is never stolen (**deterministic two-process test**: a child creates the lock with `open(wx)` and holds it before writing its PID; the parent waits ≥ hold time, child observes `STILL_HELD`, both commits land); stale recovery requires age **and** dead owner; EPERM = alive; hard ceiling for PID reuse; release never unlinks a foreign lock.
 - `test/truncate-boundary.test.ts` + `test/compaction.test.ts` — the 41-message fixture (assistant `toolCall` + `toolResult` + 39 users) plans and applies to 39 messages starting at `user-0`; multi-call turns are kept whole; a proxy cut landing on a `toolResult` is re-aligned; a transcript with no turn boundary is not truncated.
 - Windows portability: `tmpdir()`/`join()` instead of `/tmp` literals, `file://` URL for the child-process dist import, `npm` via shell on win32, `homedir()` fallback for the state dir. I don't have a Windows host — would appreciate a re-run there.
@@ -143,7 +147,7 @@ Full coverage map: `docs/TEST_MATRIX.md`.
 - [x] I have commented my code, particularly in hard-to-understand areas
 - [x] I have made corresponding changes to the documentation (`README.md`, `docs/*`, `openclaw.plugin.json` schema)
 - [x] My changes generate no new warnings (`npm run typecheck`, `npm run build` clean)
-- [x] I have added tests that prove my fix is effective or that my feature works (320 vitest cases; reviewer fixtures locked as regressions)
+- [x] I have added tests that prove my fix is effective or that my feature works (324 vitest cases; reviewer fixtures locked as regressions)
 - [x] New and existing unit tests pass locally with my changes
 - [x] I did **not** edit `CHANGELOG.md` — it is generated by release-please from my Conventional Commit PR title (a CI guard enforces this)
 

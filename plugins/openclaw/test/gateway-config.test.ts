@@ -636,4 +636,89 @@ describe("applyGatewayProviderBaseUrlsInPlace", () => {
       models: ["gpt-5.3-codex"],
     });
   });
+
+  it("no-ops when OpenClaw hands a frozen providers map already routed to the proxy", () => {
+    // OpenClaw 2026.9.x seals api.config. Session-header refresh used to throw
+    // TypeError on providers["opencode-go"] even when disk config was correct.
+    const providers = Object.freeze({
+      "opencode-go": Object.freeze({
+        baseUrl: "http://127.0.0.1:8787/v1",
+        headers: Object.freeze({
+          "x-headroom-base-url": "https://opencode.ai/zen/go",
+        }),
+        models: Object.freeze([]),
+      }),
+    });
+    const cfg: any = Object.freeze({
+      models: Object.freeze({ providers }),
+    });
+
+    const changed = applyGatewayProviderBaseUrlsInPlace(
+      cfg,
+      "http://127.0.0.1:8787",
+      ["opencode-go"],
+      {
+        providerUpstreams: { "opencode-go": "https://opencode.ai/zen/go" },
+        providerSessionHeaders: { "opencode-go": "x-opencode-session" },
+      },
+    );
+
+    expect(changed).toBe(false);
+    expect(cfg.models.providers["opencode-go"].baseUrl).toBe("http://127.0.0.1:8787/v1");
+    expect(cfg.models.providers["opencode-go"].headers["x-headroom-base-url"]).toBe(
+      "https://opencode.ai/zen/go",
+    );
+    // Frozen config cannot receive the session header refresh; callers must
+    // bake it into openclaw.json if the upstream requires it.
+    expect(cfg.models.providers["opencode-go"].headers["x-opencode-session"]).toBeUndefined();
+  });
+
+  it("throws a clear error when frozen config is not yet routed through the proxy", () => {
+    const providers = Object.freeze({
+      "opencode-go": Object.freeze({
+        baseUrl: "https://opencode.ai/zen/go",
+        models: Object.freeze([]),
+      }),
+    });
+    const cfg: any = Object.freeze({
+      models: Object.freeze({ providers }),
+    });
+
+    expect(() =>
+      applyGatewayProviderBaseUrlsInPlace(cfg, "http://127.0.0.1:8787", ["opencode-go"], {
+        providerUpstreams: { "opencode-go": "https://opencode.ai/zen/go" },
+      }),
+    ).toThrow(/frozen OpenClaw config.*opencode-go/);
+  });
+
+  it("still rewrites mutable configs that only need a session header", () => {
+    const cfg: any = {
+      models: {
+        providers: {
+          "opencode-go": {
+            baseUrl: "http://127.0.0.1:8787/v1",
+            headers: {
+              "x-headroom-base-url": "https://opencode.ai/zen/go",
+            },
+            models: [],
+          },
+        },
+      },
+    };
+
+    const changed = applyGatewayProviderBaseUrlsInPlace(
+      cfg,
+      "http://127.0.0.1:8787",
+      ["opencode-go"],
+      {
+        providerUpstreams: { "opencode-go": "https://opencode.ai/zen/go" },
+        providerSessionHeaders: { "opencode-go": "x-opencode-session" },
+      },
+    );
+
+    expect(changed).toBe(true);
+    expect(typeof cfg.models.providers["opencode-go"].headers["x-opencode-session"]).toBe(
+      "string",
+    );
+  });
 });

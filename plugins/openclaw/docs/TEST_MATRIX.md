@@ -4,7 +4,7 @@ Run everything:
 
 ```bash
 cd plugins/openclaw
-npm test                    # 320 vitest cases
+npm test                    # 324 vitest cases
 npm run typecheck
 npm run build
 npm run test:stress         # native-tool mock stress

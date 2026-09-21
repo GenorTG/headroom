@@ -122,9 +122,30 @@ export function applyGatewayProviderBaseUrlsInPlace(
   const providerUpstreams = overrides?.providerUpstreams ?? {};
   const providerSessionHeaders = overrides?.providerSessionHeaders ?? {};
 
-  const models = (cfg.models ??= {});
-  const providers = (models.providers ??= {});
+  // OpenClaw 2026.9.x often hands plugins a frozen/sealed `api.config`.
+  // Mutating it throws `TypeError: Cannot assign to read only property ...`
+  // (commonly seen with `opencode-go` when only the session header needs a
+  // refresh). Prefer a no-op when disk config is already routed; otherwise
+  // surface a clear error so operators know to bake routing into openclaw.json.
+  let models: any;
+  let providers: any;
+  try {
+    models = (cfg.models ??= {});
+    providers = (models.providers ??= {});
+  } catch (error) {
+    if (!isReadonlyMutationError(error)) {
+      throw error;
+    }
+    models = cfg.models;
+    providers = models?.providers;
+    if (!providers || typeof providers !== "object") {
+      throw error;
+    }
+  }
+
+  const canWriteProviders = isMutableObject(providers);
   let changed = false;
+  const blocked: string[] = [];
 
   for (const providerId of providerIds) {
     const currentValue = providers[providerId];
@@ -178,13 +199,86 @@ export function applyGatewayProviderBaseUrlsInPlace(
       ) || mutated;
     }
 
-    if (mutated) {
+    if (!mutated) {
+      continue;
+    }
+
+    if (!canWriteProviders || !isMutableObject(providers)) {
+      if (providerAlreadyRouted(currentConfig, nextBaseUrl, providerUpstreams[providerId])) {
+        // Disk/config already points at the proxy with the upstream header.
+        // Skipping a frozen in-memory session-header refresh is safe.
+        continue;
+      }
+      blocked.push(providerId);
+      continue;
+    }
+
+    try {
       providers[providerId] = nextConfig;
       changed = true;
+    } catch (error) {
+      if (!isReadonlyMutationError(error)) {
+        throw error;
+      }
+      if (providerAlreadyRouted(currentConfig, nextBaseUrl, providerUpstreams[providerId])) {
+        continue;
+      }
+      blocked.push(providerId);
     }
   }
 
+  if (blocked.length > 0) {
+    throw new TypeError(
+      `Cannot assign to read only property '${blocked[0]}' of object '#<Object>' ` +
+        `(frozen OpenClaw config; bake proxy baseUrl + x-headroom-base-url into ` +
+        `models.providers for: ${blocked.join(", ")})`,
+    );
+  }
+
   return changed;
+}
+
+function isMutableObject(value: unknown): boolean {
+  return (
+    !!value &&
+    typeof value === "object" &&
+    !Object.isFrozen(value) &&
+    !Object.isSealed(value) &&
+    Object.isExtensible(value)
+  );
+}
+
+function isReadonlyMutationError(error: unknown): boolean {
+  return (
+    error instanceof TypeError &&
+    /read only property|Cannot assign|object is not extensible|Cannot add property/i.test(
+      String(error.message ?? error),
+    )
+  );
+}
+
+function providerAlreadyRouted(
+  currentConfig: Record<string, any>,
+  nextBaseUrl: string,
+  upstreamHeaderValue: string | undefined,
+): boolean {
+  const currentBaseUrl =
+    typeof currentConfig.baseUrl === "string" ? currentConfig.baseUrl.trim() : "";
+  if (!currentBaseUrl || normalizeProxyBaseUrl(currentBaseUrl) !== normalizeProxyBaseUrl(nextBaseUrl)) {
+    return false;
+  }
+  if (!upstreamHeaderValue) {
+    return true;
+  }
+  const headers =
+    currentConfig.headers && typeof currentConfig.headers === "object" && !Array.isArray(currentConfig.headers)
+      ? currentConfig.headers
+      : {};
+  return headers["x-headroom-base-url"] === upstreamHeaderValue;
+}
+
+function normalizeProxyBaseUrl(value: string): string {
+  return value.replace(/\/+$/, "");
 }
 
 /**

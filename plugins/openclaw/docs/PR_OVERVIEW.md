@@ -68,7 +68,7 @@ paths or credentials.
 
 ### Tests
 
-See [TEST_MATRIX.md](./TEST_MATRIX.md). Summary: **320 vitest cases** across 22 files, plus optional live proxy stress scripts.
+See [TEST_MATRIX.md](./TEST_MATRIX.md). Summary: **324 vitest cases** across 22 files, plus optional live proxy stress scripts.
 
 ## Merge with upstream `main` (2026-09-11) — done
 
