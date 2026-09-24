@@ -130,7 +130,7 @@ function recoverStaleLock(lockPath: string): boolean {
 function tryAcquire(lockPath: string, owner: StoreLockOwner): boolean {
   const payload = `${JSON.stringify(owner)}\n`;
   const tmpPath = `${lockPath}.${owner.pid}.${owner.token}`;
-  writeFileSync(tmpPath, payload, "utf8");
+  writeFileSync(tmpPath, payload, { encoding: "utf8", mode: 0o600 });
   try {
     linkSync(tmpPath, lockPath);
     return true;
@@ -150,7 +150,7 @@ function tryAcquire(lockPath: string, owner: StoreLockOwner): boolean {
   // window where the file is empty is covered by the age-based stale rule.
   let fd: number | undefined;
   try {
-    fd = openSync(lockPath, "wx");
+    fd = openSync(lockPath, "wx", 0o600);
     writeSync(fd, payload);
     return true;
   } catch (error) {

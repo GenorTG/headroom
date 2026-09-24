@@ -645,6 +645,7 @@ describe("applyGatewayProviderBaseUrlsInPlace", () => {
         baseUrl: "http://127.0.0.1:8787/v1",
         headers: Object.freeze({
           "x-headroom-base-url": "https://opencode.ai/zen/go",
+          "x-opencode-session": "11111111-1111-4111-8111-111111111111",
         }),
         models: Object.freeze([]),
       }),
@@ -668,9 +669,31 @@ describe("applyGatewayProviderBaseUrlsInPlace", () => {
     expect(cfg.models.providers["opencode-go"].headers["x-headroom-base-url"]).toBe(
       "https://opencode.ai/zen/go",
     );
-    // Frozen config cannot receive the session header refresh; callers must
-    // bake it into openclaw.json if the upstream requires it.
-    expect(cfg.models.providers["opencode-go"].headers["x-opencode-session"]).toBeUndefined();
+    expect(cfg.models.providers["opencode-go"].headers["x-opencode-session"]).toBe(
+      "11111111-1111-4111-8111-111111111111",
+    );
+  });
+
+  it("throws when frozen config is routed but missing a required session header", () => {
+    const providers = Object.freeze({
+      "opencode-go": Object.freeze({
+        baseUrl: "http://127.0.0.1:8787/v1",
+        headers: Object.freeze({
+          "x-headroom-base-url": "https://opencode.ai/zen/go",
+        }),
+        models: Object.freeze([]),
+      }),
+    });
+    const cfg: any = Object.freeze({
+      models: Object.freeze({ providers }),
+    });
+
+    expect(() =>
+      applyGatewayProviderBaseUrlsInPlace(cfg, "http://127.0.0.1:8787", ["opencode-go"], {
+        providerUpstreams: { "opencode-go": "https://opencode.ai/zen/go" },
+        providerSessionHeaders: { "opencode-go": "x-opencode-session" },
+      }),
+    ).toThrow(/frozen OpenClaw config.*providerSessionHeaders.*opencode-go/);
   });
 
   it("throws a clear error when frozen config is not yet routed through the proxy", () => {

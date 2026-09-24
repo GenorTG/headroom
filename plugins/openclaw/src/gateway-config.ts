@@ -203,10 +203,17 @@ export function applyGatewayProviderBaseUrlsInPlace(
       continue;
     }
 
+    const alreadyRouted = providerAlreadyRouted({
+      currentConfig,
+      nextBaseUrl,
+      upstreamHeaderValue: providerUpstreams[providerId],
+      sessionHeaderName,
+    });
+
     if (!canWriteProviders || !isMutableObject(providers)) {
-      if (providerAlreadyRouted(currentConfig, nextBaseUrl, providerUpstreams[providerId])) {
-        // Disk/config already points at the proxy with the upstream header.
-        // Skipping a frozen in-memory session-header refresh is safe.
+      if (alreadyRouted) {
+        // Disk/config already has proxy baseUrl, upstream header, and any
+        // required session header — nothing left to write.
         continue;
       }
       blocked.push(providerId);
@@ -220,7 +227,7 @@ export function applyGatewayProviderBaseUrlsInPlace(
       if (!isReadonlyMutationError(error)) {
         throw error;
       }
-      if (providerAlreadyRouted(currentConfig, nextBaseUrl, providerUpstreams[providerId])) {
+      if (alreadyRouted) {
         continue;
       }
       blocked.push(providerId);
@@ -230,7 +237,8 @@ export function applyGatewayProviderBaseUrlsInPlace(
   if (blocked.length > 0) {
     throw new TypeError(
       `Cannot assign to read only property '${blocked[0]}' of object '#<Object>' ` +
-        `(frozen OpenClaw config; bake proxy baseUrl + x-headroom-base-url into ` +
+        `(frozen OpenClaw config; bake proxy baseUrl + x-headroom-base-url` +
+        `${Object.keys(providerSessionHeaders).length > 0 ? " + providerSessionHeaders" : ""} into ` +
         `models.providers for: ${blocked.join(", ")})`,
     );
   }
@@ -249,36 +257,53 @@ function isMutableObject(value: unknown): boolean {
 }
 
 function isReadonlyMutationError(error: unknown): boolean {
+  if (!(error instanceof TypeError)) {
+    return false;
+  }
+  const message = String(error.message ?? error);
+  // Prefer plain substring checks over a single alternation regex (CodeQL ReDoS).
   return (
-    error instanceof TypeError &&
-    /read only property|Cannot assign|object is not extensible|Cannot add property/i.test(
-      String(error.message ?? error),
-    )
+    message.includes("read only property") ||
+    message.includes("Cannot assign") ||
+    message.includes("object is not extensible") ||
+    message.includes("Cannot add property")
   );
 }
 
-function providerAlreadyRouted(
-  currentConfig: Record<string, any>,
-  nextBaseUrl: string,
-  upstreamHeaderValue: string | undefined,
-): boolean {
+function providerAlreadyRouted(params: {
+  currentConfig: Record<string, any>;
+  nextBaseUrl: string;
+  upstreamHeaderValue: string | undefined;
+  sessionHeaderName: string | undefined;
+}): boolean {
+  const { currentConfig, nextBaseUrl, upstreamHeaderValue, sessionHeaderName } = params;
   const currentBaseUrl =
     typeof currentConfig.baseUrl === "string" ? currentConfig.baseUrl.trim() : "";
   if (!currentBaseUrl || normalizeProxyBaseUrl(currentBaseUrl) !== normalizeProxyBaseUrl(nextBaseUrl)) {
     return false;
   }
-  if (!upstreamHeaderValue) {
-    return true;
-  }
   const headers =
     currentConfig.headers && typeof currentConfig.headers === "object" && !Array.isArray(currentConfig.headers)
       ? currentConfig.headers
       : {};
-  return headers["x-headroom-base-url"] === upstreamHeaderValue;
+  if (upstreamHeaderValue && headers["x-headroom-base-url"] !== upstreamHeaderValue) {
+    return false;
+  }
+  if (sessionHeaderName) {
+    const sessionValue = headers[sessionHeaderName];
+    if (typeof sessionValue !== "string" || sessionValue.trim().length === 0) {
+      return false;
+    }
+  }
+  return true;
 }
 
 function normalizeProxyBaseUrl(value: string): string {
-  return value.replace(/\/+$/, "");
+  let end = value.length;
+  while (end > 0 && value.charCodeAt(end - 1) === 47 /* / */) {
+    end -= 1;
+  }
+  return end === value.length ? value : value.slice(0, end);
 }
 
 /**
